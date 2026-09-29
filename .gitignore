@@ -1,0 +1,7 @@
+# runtime state — user-owned, never committed
+ninog/config/
+ninog/snapshots/
+ninog/reportlog/
+ninog/exports/
+__pycache__/
+*.pyc
