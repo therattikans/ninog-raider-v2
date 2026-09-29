@@ -12,6 +12,7 @@
 # ==============================================================
 
 import json
+import os
 import platform
 import random
 import re
@@ -837,6 +838,9 @@ def copy_to_clipboard(text):
         pass
     import subprocess
     candidates = []
+    if os.environ.get("TERMUX_VERSION") or "com.termux" in os.environ.get("PREFIX", ""):
+        # Termux:API clipboard, the only clipboard a phone session has.
+        candidates.append((["termux-clipboard-set"], None))
     if platform.system() == "Windows":
         candidates.append((["clip"], None))
     elif platform.system() == "Darwin":
@@ -844,6 +848,7 @@ def copy_to_clipboard(text):
     else:
         candidates.append((["xclip", "-selection", "clipboard"], None))
         candidates.append((["wl-copy"], None))
+        candidates.append((["termux-clipboard-set"], None))  # PREFIX not always set
     for cmd, _ in candidates:
         try:
             proc = subprocess.run(cmd, input=text.encode("utf-8"),
