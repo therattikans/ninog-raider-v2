@@ -2,6 +2,9 @@
 
 Thanks for waiting, here it is.
 
+# ⚠️ We didn't want to keep you waiting for too long, so we performed multiple minimal tests that may not have covered everything, expect bugs.
+# If you experience an error or bug, please report it in the Issues tab of our main repo.
+
 > **New to this?** Skip straight to your device: [Android (Termux)](#-android-termux) · [Windows](#-windows) · [Linux](#-linux) · [macOS](#-macos). Every step is copy-paste. You don't need to know how to code.
 
 ---
