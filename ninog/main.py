@@ -13,7 +13,8 @@
 #     src/ops.py   every flow and operation
 #
 #   config/, reportlog/ and snapshots/ are created on demand next
-#   to this file, exactly as nnv2.py did.
+#   to this file
+#   thanks for using our tool
 # ==============================================================
 
 import importlib
