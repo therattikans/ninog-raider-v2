@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================
-#   NiNog Raker V2.3 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   main.py | entry point
 #
 #   Usage:   python main.py        (from inside ninog/)

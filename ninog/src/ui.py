@@ -1,5 +1,5 @@
 # ==============================================================
-#   NiNog Raker V2.3 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   src/ui.py | themes, gradient, prompts, transitions,
 #              bouncing-R live displays
 # ==============================================================
@@ -177,7 +177,6 @@ def mix(c1, c2, t):
 
 
 def grad(text, ctx=None):
-    global _GRAD_PHASE
     ctx = ctx or _CTX
     if ctx is None or not gradient_on(ctx):
         return f"[orange]{text}[/orange]"
@@ -506,7 +505,16 @@ class TodoBoard:
     """
 
     def __init__(self, items, title="", subtitle=""):
-        self.items = list(items)
+        # Items are (depth, title) pairs. A bare string is tolerated and
+        # treated as depth 0 -- one caller passed pre-indented strings and
+        # _touch/_render unpacked them into a crash mid-run.
+        norm = []
+        for it in items:
+            if isinstance(it, (tuple, list)) and len(it) == 2:
+                norm.append((int(it[0]), str(it[1])))
+            else:
+                norm.append((0, str(it)))
+        self.items = norm
         self._states = [PENDING] * len(self.items)
         self._notes = [""] * len(self.items)
         self._cursor = 0
@@ -845,7 +853,6 @@ def _progressive_reveal(text, mode, ms, on_screen):
 
 
 def present_frame(ctx, render_fn):
-    global _GRAD_PHASE
     mode = ctx.config.setting("transition", "mercury")
     ms = int(ctx.config.setting("transition_ms", 350))
     gr_on = gradient_on(ctx)
