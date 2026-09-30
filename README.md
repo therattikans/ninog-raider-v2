@@ -343,8 +343,6 @@ next to `main.py` and are git-ignored.
 - Snapshots before every destructive op, restore for roles/channels/settings/
   messages/bans, etcetera.
 
-  - No auto-download for imports this time, sorry.
-
 ## Layout
 
 ```
