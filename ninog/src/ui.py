@@ -694,11 +694,46 @@ def notice(title, lines, style="orange"):
     )
 
 
+# ------------------------------------------------------------
+# SCRIPTED INPUT FEED (workflow fire-time replay)
+# ------------------------------------------------------------
+# When a workflow step runs, the engine feeds the op the answers that were
+# recorded at build time through this hook. Empty feed = normal live prompts.
+_INPUT_FEED = None
+
+
+def set_input_feed(feed):
+    """Install/clear a deque of pre-recorded prompt answers.
+
+    Any non-None value marks 'a workflow step is running': press_enter()
+    pauses are skipped entirely so a fire is never held up by an op's
+    trailing 'press enter'. Real prompts fall through to live input once
+    the recording runs dry.
+    """
+    global _INPUT_FEED
+    _INPUT_FEED = feed
+
+
+def _fed():
+    """Next recorded answer, or None when the feed is empty/absent."""
+    if _INPUT_FEED is None:
+        return None
+    try:
+        v = _INPUT_FEED.popleft()
+        console.print(f"[dim]> replay: {v}[/dim]")
+        return v
+    except IndexError:
+        return None
+
 def ask(text, default=None):
     show_default = default not in (None, "")
     prompt = f"[orange]{text}[/orange]"
     if show_default:
         prompt += f" [dim]({default})[/dim]"
+    fed = _fed()
+    if fed is not None:
+        console.print(prompt + f" [white]›[/white] [white]{fed}[/white]")
+        return fed if fed else ("" if default is None else default)
     console.print(prompt + " [white]›[/white]", end=" ")
     try:
         raw = input().strip()
@@ -736,12 +771,17 @@ def confirm(text, default=False):
     else:
         d = "[dim]y[/dim]/[white]n[/white]"
     while True:
-        console.print(f"[orange]{text}[/orange] [dim]([/dim]{d}[dim])[/dim]", end=" ")
-        try:
-            raw = input().strip().lower()
-        except EOFError:
-            console.print()
-            return default
+        fed = _fed()
+        if fed is not None:
+            raw = fed.strip().lower()
+            console.print(f"[orange]{text}[/orange] [dim]([/dim]{d}[dim])[/dim] [white]{raw}[/white]")
+        else:
+            console.print(f"[orange]{text}[/orange] [dim]([/dim]{d}[dim])[/dim]", end=" ")
+            try:
+                raw = input().strip().lower()
+            except EOFError:
+                console.print()
+                return default
         if not raw:
             console.print()
             return default
@@ -756,6 +796,8 @@ def confirm(text, default=False):
 
 
 def press_enter():
+    if _INPUT_FEED is not None:
+        return  # a workflow step is running; never pause the fire
     console.print("[orange]›[/orange] [dim]press enter[/dim]", end=" ")
     try:
         input()

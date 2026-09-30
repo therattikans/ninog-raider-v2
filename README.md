@@ -34,7 +34,7 @@ next to `main.py` and are git-ignored.
 - **Ban detection**: a watchdog thread probes the bot's own membership on an
   interval and raises an alert the moment the bot is kicked or banned.
   Interval configurable in Settings ▸ Watchdog.
-- **Workflow engine**: V1-style screen (Create / Execute / Delete / Set
+- **Workflow engine** — harshly simple: chain unlimited ops, pre-set each op's answers when you build it, pick ONE trigger (manual / on server select / on ban detected / interval), and it fires hands-free. No condition trees, no branch editors. The only edits that exist: re-record a step's inputs, or delete the workflow.
   Triggers) with unlimited chained ops, plus waits, conditions, gates, loops
   and notes. **Triggers**: manual, on-guild-select, on-ban-detected, and
   interval (every N seconds).
@@ -62,17 +62,6 @@ ninog/
 └── src/
     ├── core.py      paths, config, vault, REST client, watchdog, crash reporter
     ├── ui.py        themes, gradient, bouncing-R live displays, transitions
-    ├── workflow.py  workflow engine: chains, conditions, triggers
+    ├── workflow.py  workflow engine: chained ops with pre-set inputs
     └── ops.py       every interactive flow and operation
 ```
-
-## Testing
-
-```bash
-python tests/integration_test.py
-```
-
-The offline regression suite (33 checks) drives every interactive flow —
-role engine, webhook extraction/relay/export, workflow engine + triggers,
-crash bundles, watchdog, narrow-terminal rendering, rate-limit retries —
-against a scripted terminal and a fake Discord REST end. No token needed.
