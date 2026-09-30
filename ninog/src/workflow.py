@@ -1,44 +1,35 @@
 # ==============================================================
 #   NiNog Raker v2.0 | THE RATTIKANS
-#   src/workflow.py | workflow engine: chains, triggers
+#   src/workflow.py | workflow engine — chained ops, pre-set inputs
 # ==============================================================
 #
-#   A workflow is an ordered list of steps, with NO cap on how many
-#   ops you chain. Step kinds:
+#   A workflow is dead simple by design:
 #
-#     op        run any op from the registry, referenced by slug
-#     wait      fixed delay, or poll-until-condition with a timeout
-#     condition fetch a live guild stat and branch on it (then / else)
-#     confirm   a gate: the run stops cleanly if the user declines
-#     loop      run a nested list of steps N times
-#     note      an informational line, marked done immediately
+#     name      what it is called
+#     trigger   ONE of: manual / on server select / on ban detected /
+#               every N seconds
+#     steps     an ordered, unlimited chain of ops. Each op carries the
+#               answers it will need, recorded ONCE at build time, so a
+#               run never pauses to ask for them mid-fire.
 #
-#   Every workflow also carries triggers:
+#   That is the whole model. No condition editor, no loop builder, no
+#   branch tree in the UI — the engine still EXECUTES legacy files
+#   with those kinds (wait/condition/loop/note/confirm), but the
+#   builder only produces clean op chains with pre-set inputs.
 #
-#     manual           only runs from the execute menu (default)
-#     on_guild_select  fires right after a guild is selected
-#     on_ban_detected  fires when the watchdog reports the bot was
-#                      kicked or banned from the selected guild
-#     interval         fires every N seconds while menus are up
-#
-#   Engine screen follows the V1 layout: numbered actions, saved
-#   workflows listed with step counts and their triggers.
+#   Editing a workflow means exactly two things: re-record a step's
+#   answers, or delete the workflow. Nothing else exists to break.
 #
 #   This module imports src.core and src.ui only. It never imports
 #   src.ops -- ops.py imports this module and hands the op registry
 #   in as a parameter, which keeps the one dangerous edge from
-#   being circular. The engine entry point itself is excluded from
-#   the chainable index so a workflow cannot run the manager.
+#   being circular.
 # ==============================================================
 
 import json
 import re
 import time
-from datetime import datetime
-
-from rich import box
-from rich.panel import Panel
-from rich.table import Table
+from collections import deque
 
 from .core import (
     PERMISSION_BITS,
@@ -56,26 +47,21 @@ from .ui import (
     ask_int,
     confirm,
     console,
-    grad,
     notice,
-    present_frame,
     press_enter,
-    print_header,
     sanitize_name,
     screen_title,
+    set_input_feed,
 )
 
-MAX_DEPTH = 3            # nesting limit for conditions and loops
-MAX_LOOP_TIMES = 50      # per-loop pass cap; the CHAIN ITSELF has no cap
-MAX_STEPS_SHOWN = 18     # builder table page size
+MAX_LOOP_TIMES = 50          # per-loop pass cap in legacy files; the chain has no cap
+EXCLUDED_SLUGS = {"workflow_engine"}   # the manager can never chain itself
+MAX_RECORDED_ANSWERS = 200   # sane ceiling when scripting an op's inputs
 
-# The engine manages workflows; running it from inside its own run would
-# recurse with no guard, so these slugs never appear in the chain index.
-EXCLUDED_SLUGS = {"workflow_engine"}
+# ------------------------------------------------------------
+# PERMISSION MODEL + INDEX
+# ------------------------------------------------------------
 
-# What each op needs, keyed by slug. An op with no entry either needs nothing
-# beyond what every bot has, or needs a privileged intent that permissions
-# cannot express -- those are listed separately in _INTENT_ONLY.
 OP_PERMISSIONS = {
     "delete_all_channels": ["MANAGE_CHANNELS"],
     "create_channels": ["MANAGE_CHANNELS"],
@@ -110,6 +96,8 @@ OP_PERMISSIONS = {
 # Ops that need a privileged gateway intent rather than a role permission.
 # They are reported as "limited" rather than "skipped" because the bot may
 # still be able to run them depending on its developer settings.
+
+
 _INTENT_ONLY = {
     "member_lookup": "SERVER MEMBERS intent",
     "scan_bots": "SERVER MEMBERS intent",
@@ -140,6 +128,8 @@ TRIGGER_KINDS = [
 # ------------------------------------------------------------
 # REGISTRY
 # ------------------------------------------------------------
+
+
 
 def slugify(name):
     return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_") or "op"
@@ -186,12 +176,19 @@ def op_limitations(slug, ctx):
 # DESCRIBE / FLATTEN
 # ------------------------------------------------------------
 
+
+# ------------------------------------------------------------
+# DESCRIBE
+# ------------------------------------------------------------
+
 def describe_step(step, index=None):
     k = step.get("kind", "?")
     if k == "op":
         slug = step.get("op", "?")
         entry = (index or {}).get(slug)
-        return entry["name"] if entry else slug
+        name = entry["name"] if entry else slug
+        n = len(step.get("answers") or [])
+        return name if not n else f"{name} [{n} pre-set]"
     if k == "wait":
         if step.get("until"):
             c = step["until"]
@@ -258,6 +255,8 @@ def _mark_branch(board, plan, branch_id):
 # ------------------------------------------------------------
 # CONDITION EVALUATION
 # ------------------------------------------------------------
+
+
 
 def _guild_stat(ctx, key, cache):
     if key in cache:
@@ -329,6 +328,8 @@ def _eval_condition(ctx, cond, cache):
 # STORAGE
 # ------------------------------------------------------------
 
+
+
 def normalize_triggers(wf):
     """Every workflow carries a trigger list; old files default to manual."""
     trig = wf.get("triggers")
@@ -350,6 +351,8 @@ def trigger_summary(wf):
         else:
             parts.append(k)
     return ", ".join(parts) or "manual"
+
+
 
 
 def load_workflows():
@@ -382,377 +385,232 @@ def delete_workflow_file(name):
     return False
 
 
-def _pick_workflow(ctx, verb="select"):
-    flows = load_workflows()
-    if not flows:
-        notice("NO WORKFLOWS", ["nothing saved in config/workflows/ yet."], "warn")
-        return None
-    table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
-                  border_style="deep", padding=(0, 2))
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("NAME", style="white")
-    table.add_column("STEPS", justify="right", style="dim")
-    table.add_column("TRIGGERS", style="dim")
-    for i, wf in enumerate(flows):
-        table.add_row(
-            str(i + 1),
-            wf.get("name", "?"),
-            str(len(flatten_steps(wf.get("steps", [])))),
-            trigger_summary(wf),
-        )
-    console.print(table)
-    choice = ask(f"1-{len(flows)} {verb} | B back").lower()
-    if choice == "b":
-        return None
-    if not (choice.isdigit() and 1 <= int(choice) <= len(flows)):
-        notice("OUT OF RANGE", [f"expected 1-{len(flows)}."], "warn")
-        return None
-    return flows[int(choice) - 1]
-
-
 # ------------------------------------------------------------
-# BUILDER
+# ANSWER RECORDER — pre-set the op's inputs for when it fires
 # ------------------------------------------------------------
 
-def _render_steps(ctx, index, steps, depth=0):
-    lines = []
-    for i, s in enumerate(steps):
-        pad = "    " * depth
-        lines.append(f"[orange]{i + 1:02d}[/orange] {pad}[white]{describe_step(s, index)}[/white]")
-        if step_kind(s) == "condition":
-            if s.get("then"):
-                lines.append(f"{pad}   [dim]then[/dim]")
-                lines += _render_steps(ctx, index, s["then"], depth + 1)
-            if s.get("else"):
-                lines.append(f"{pad}   [dim]else[/dim]")
-                lines += _render_steps(ctx, index, s["else"], depth + 1)
-        elif step_kind(s) == "loop":
-            if s.get("steps"):
-                lines.append(f"{pad}   [dim]body[/dim]")
-                lines += _render_steps(ctx, index, s["steps"], depth + 1)
-    return lines
-
-
-def _chainable_entries(index):
-    """Flat list of (slug, entry) in registry order."""
-    return sorted(index.items(), key=lambda kv: (kv[1].get("page", ""), kv[1]["name"]))
-
-
-def _pick_op_chained(ctx, index):
-    """V1-style 'Available actions' list. Numbered, paginated, 0 cancels."""
-    entries = _chainable_entries(index)
-    if not entries:
-        notice("EMPTY", ["no chainable ops found."], "warn")
-        return None
-    page_idx = 0
-    per = 20
-    pages = [entries[i:i + per] for i in range(0, len(entries), per)]
-    while True:
-        chunk_ = pages[page_idx]
-        console.print()
-        console.print("  [white]Available actions:[/white]")
-        console.print()
-        for i, (slug, entry) in enumerate(chunk_):
-            n = page_idx * per + i + 1
-            console.print(
-                f"    [orange][{n:2d}][/orange] [white]{entry['name']}[/white] "
-                f"[dim]{entry.get('page', '')}[/dim]"
-            )
-        console.print()
-        nav = f"  [dim]page {page_idx + 1}/{len(pages)}"
-        if len(pages) > 1:
-            nav += " | N next | P prev"
-        nav += " | 0 cancel[/dim]"
-        console.print(nav)
-        raw = ask("pick action number").lower().strip()
-        if raw in ("0", "b", ""):
-            return None
-        if raw == "n" and len(pages) > 1:
-            page_idx = (page_idx + 1) % len(pages)
-            continue
-        if raw == "p" and len(pages) > 1:
-            page_idx = (page_idx - 1) % len(pages)
-            continue
-        if raw.isdigit() and 1 <= int(raw) <= len(entries):
-            return entries[int(raw) - 1][0]
-        notice("OUT OF RANGE", [f"expected 1-{len(entries)} | 0 cancel."], "warn")
-
-
-def _build_condition(ctx):
+def _record_answers(ctx, op_name):
+    """Capture the exact answers an op will need, in prompt order."""
     console.print()
-    for i, (key, label) in enumerate(CONDITION_CHECKS):
-        console.print(f"  [orange][{i + 1:02d}][/orange] [white]{key}[/white] [dim]| {label}[/dim]")
-    pick = ask(f"1-{len(CONDITION_CHECKS)} check").lower()
-    if not (pick.isdigit() and 1 <= int(pick) <= len(CONDITION_CHECKS)):
-        notice("OUT OF RANGE", [f"expected 1-{len(CONDITION_CHECKS)}."], "warn")
-        return None
-    check = CONDITION_CHECKS[int(pick) - 1][0]
+    screen_title(f"PRE-SET INPUTS | {op_name}", "what the op will ask, answered once, now")
+    console.print("  [dim]Type each answer exactly as you would answer the op live,[/dim]")
+    console.print("  [dim]in order, one per line. The op reuses them when it fires.[/dim]")
+    console.print("  [dim]Blank line = take the op's default for that question.[/dim]")
+    console.print("  [dim]Type END on its own line to finish recording.[/dim]")
+    answers = []
+    while len(answers) < MAX_RECORDED_ANSWERS:
+        raw = ask(f"answer #{len(answers) + 1} (END finishes)")
+        if raw is None or str(raw).strip().upper() == "END":
+            break
+        answers.append(raw)
+    if answers:
+        notice("RECORDED",
+               [f"[white]{len(answers)}[/white] answer(s) locked in for [white]{op_name}[/white].",
+                "the op fires hands-free. if the live server state forces",
+                "an extra question, it gets asked at run time."], "good")
+    else:
+        notice("NOTHING RECORDED",
+               [f"[white]{op_name}[/white] will ask its questions live when it fires."], "warn")
+    return answers
 
-    if check == "always":
-        return {"kind": "condition", "check": "always", "cmp": "==", "value": 1,
-                "then": [], "else": []}
 
+def _pick_trigger():
+    """One trigger, picked at creation. No separate editor exists."""
     console.print()
-    for i, cmp in enumerate(COMPARATORS):
-        console.print(f"  [orange][{i + 1}][/orange] [white]{cmp}[/white]")
-    pick = ask(f"1-{len(COMPARATORS)} comparator").lower()
-    cmp = COMPARATORS[int(pick) - 1] if (pick.isdigit() and 1 <= int(pick) <= len(COMPARATORS)) else ">="
-    value = ask("compare value")
-    if value == "":
-        value = "0"
-    return {"kind": "condition", "check": check, "cmp": cmp, "value": value,
-            "then": [], "else": []}
+    screen_title("TRIGGER", "when this workflow fires")
+    console.print("  [orange][1][/orange] [white]Manual only[/white] [dim]| run it yourself[/dim]")
+    console.print("  [orange][2][/orange] [white]On server select[/white] [dim]| right after picking a server[/dim]")
+    console.print("  [orange][3][/orange] [white]On ban detected[/white] [dim]| when the bot is kicked/banned[/dim]")
+    console.print("  [orange][4][/orange] [white]Every N seconds[/white] [dim]| while menus are up[/dim]")
+    raw = ask("1-4 | B back").lower().strip()
+    if raw in ("b", "", "q"):
+        return None
+    if raw == "1":
+        return {"kind": "manual"}
+    if raw == "2":
+        return {"kind": "on_guild_select"}
+    if raw == "3":
+        return {"kind": "on_ban_detected"}
+    if raw == "4":
+        secs = ask_int("seconds between fires", 300)
+        return {"kind": "interval", "seconds": max(30, int(secs or 300))}
+    notice("OUT OF RANGE", ["1-4 | B back."], "warn")
+    return None
 
 
-def _build_list(ctx, index, title, depth=0):
-    """Edit one list of steps. Returns the list, or None if cancelled.
-
-    The chain has NO maximum length: keep adding ops until you press D.
-    """
-    steps = []
-    while True:
-        console.print()
-        screen_title(title, f"depth {depth}/{MAX_DEPTH} | {len(steps)} steps chained")
-        body = _render_steps(ctx, index, steps) or ["[faint](chain is empty)[/faint]"]
-        console.print(Panel("\n".join(body), border_style="deep", box=box.ROUNDED,
-                            padding=(0, 1)))
-        console.print(
-            "[dim][A] add op  [W] wait  [C] condition  [G] gate  [L] loop  [N] note  "
-            "[D] done  [Q] cancel[/dim]"
-        )
-        console.print("[dim][X n] delete step   [M n] move step up   | no limit on chain length[/dim]")
-        raw = ask("Add").lower().strip()
-
-        if raw in ("q", "quit"):
-            return None
-        if raw in ("d", "done", ""):
-            return steps
-
-        if raw == "a":
-            slug = _pick_op_chained(ctx, index)
-            if slug:
-                steps.append({"kind": "op", "op": slug})
-                console.print(f"  [good]+[/good] {index[slug]['name']} [dim]| step {len(steps)}[/dim]")
-                missing = missing_perms(slug, ctx)
-                if missing:
-                    notice("PERMISSION NOTE",
-                           [f"[white]{index[slug]['name']}[/white] needs "
-                            f"[white]{', '.join(missing)}[/white].",
-                            "it will be skipped at run time unless the bot "
-                            "gains that permission."], "warn")
-            continue
-
-        if raw == "w":
-            seconds = ask_int("seconds to wait", 5)
-            seconds = max(1, min(3600, seconds))
-            step = {"kind": "wait", "seconds": seconds}
-            if confirm("wait for a condition instead of a fixed time?", False):
-                cond = _build_condition(ctx)
-                if cond:
-                    step = {
-                        "kind": "wait",
-                        "seconds": ask_int("give up after (seconds)", 120),
-                        "poll": max(1, ask_int("check every (seconds)", 3)),
-                        "until": {
-                            "check": cond["check"], "cmp": cond["cmp"],
-                            "value": cond["value"],
-                        },
-                    }
-            steps.append(step)
-            continue
-
-        if raw == "c":
-            if depth >= MAX_DEPTH:
-                notice("TOO DEEP", [f"nesting is capped at {MAX_DEPTH} levels."], "warn")
-                continue
-            cond = _build_condition(ctx)
-            if not cond:
-                continue
-            cond["then"] = _build_list(ctx, index, "THEN BRANCH", depth + 1) or []
-            if confirm("add an else branch?", False):
-                cond["else"] = _build_list(ctx, index, "ELSE BRANCH", depth + 1) or []
-            steps.append(cond)
-            continue
-
-        if raw == "g":
-            prompt = ask("gate prompt", "continue the workflow?")
-            if prompt:
-                steps.append({"kind": "confirm", "prompt": prompt})
-            continue
-
-        if raw == "l":
-            if depth >= MAX_DEPTH:
-                notice("TOO DEEP", [f"nesting is capped at {MAX_DEPTH} levels."], "warn")
-                continue
-            times = ask_int("how many passes", 2)
-            times = max(1, min(MAX_LOOP_TIMES, times))
-            body = _build_list(ctx, index, "LOOP BODY", depth + 1)
-            if body:
-                steps.append({"kind": "loop", "times": times, "steps": body})
-            continue
-
-        if raw == "n":
-            text = ask("note text")
-            if text:
-                steps.append({"kind": "note", "text": text})
-            continue
-
-        m = re.match(r"^\s*x\s*(\d+)\s*$", raw)
-        if m:
-            n = int(m.group(1))
-            if 1 <= n <= len(steps):
-                removed = steps.pop(n - 1)
-                console.print(f"  [warn]-[/warn] {describe_step(removed, index)}")
-            else:
-                notice("OUT OF RANGE", [f"expected 1-{len(steps)}."], "warn")
-            continue
-
-        m = re.match(r"^\s*m\s*(\d+)\s*$", raw)
-        if m:
-            n = int(m.group(1))
-            if 2 <= n <= len(steps):
-                steps.insert(n - 2, steps.pop(n - 1))
-            elif n == 1:
-                notice("NOPE", ["step 1 is already first."], "warn")
-            else:
-                notice("OUT OF RANGE", [f"expected 1-{len(steps)}."], "warn")
-            continue
-
-        notice("UNKNOWN", ["A W C G L N D Q | X n | M n."], "warn")
+def _pick_op(ctx, index):
+    """Flat numbered picker over every chainable op."""
+    entries = sorted(index.items(), key=lambda kv: (kv[1].get("page", ""), kv[1]["name"]))
+    console.print()
+    screen_title("ADD OP", "every op, one number away")
+    for i, (slug, e) in enumerate(entries, 1):
+        console.print(f"  [orange][{i:02d}][/orange] [white]{e['name']}[/white] "
+                      f"[dim]{e.get('page', '')} | {e.get('desc', '')}[/dim]")
+    raw = ask(f"1-{len(entries)} | B back").lower().strip()
+    if raw in ("b", "", "q"):
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= len(entries):
+        return entries[int(raw) - 1]
+    notice("OUT OF RANGE", [f"1-{len(entries)} | B back."], "warn")
+    return None
 
 
 def create_workflow(ctx, index):
-    """V1 two-screen flow: name, then Available actions until Done."""
-    if index is None or not index:
-        notice("NO OPS", ["the op registry is empty."], "bad")
-        return
-    if not (ctx.perms & PERMISSION_BITS["ADMINISTRATOR"]):
-        notice("NOT ADMINISTRATOR",
-               ["this bot does not hold administrator.",
-                "ops needing permissions you lack will be flagged in the preview",
-                "and skipped at run time."], "warn")
+    """name -> trigger -> chain ops with pre-set inputs -> save. Done."""
+    screen_title("NEW WORKFLOW", "simple on purpose")
+    name = ask("workflow name")
+    if not (name or "").strip():
+        notice("CANCELLED", ["no name, no workflow."], "warn")
+        return None
+    trigger = _pick_trigger()
+    if trigger is None:
+        return None
 
-    name = ask("Workflow name")
-    if not name:
-        return
-    if any(w.get("name") == name for w in load_workflows()):
-        if not confirm(f"[white]{name}[/white] already exists | overwrite?"):
-            return
+    steps = []
+    while True:
+        console.print()
+        if steps:
+            console.print(f"  [dim]chain so far ({len(steps)}):[/dim]")
+            for i, s in enumerate(steps, 1):
+                console.print(f"    [dim]{i:02d}.[/dim] {describe_step(s, index)}")
+        picked = _pick_op(ctx, index)
+        if picked is None:
+            break
+        slug, entry = picked
+        # The contract: options are chosen NOW, for when it fires — never
+        # invented mid-run.
+        answers = _record_answers(ctx, entry["name"])
+        steps.append({"kind": "op", "op": slug, "answers": answers})
 
-    steps = _build_list(ctx, index, f"WORKFLOW | {name}")
-    if steps is None:
-        notice("CANCELLED", ["nothing saved."], "warn")
-        return
     if not steps:
-        notice("EMPTY", ["a workflow needs at least one step."], "warn")
-        return
-
-    wf = {
-        "name": name,
-        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "stop_on_error": confirm("stop the run when a step fails?", True),
-        "triggers": [{"kind": "manual"}],
-        "steps": steps,
-    }
-    # Offer triggers immediately; that is where most people want them anyway.
-    if confirm("set triggers now? (default: manual)", False):
-        _edit_triggers(ctx, wf)
-    path = save_workflow(wf)
+        notice("EMPTY", ["a workflow with no steps was not saved."], "warn")
+        return None
+    flow = {"name": name.strip(), "steps": steps, "triggers": [trigger]}
+    path = save_workflow(flow)
     ctx.logger.log("WORKFLOW_SAVED",
-                   f"{name} | {len(steps)} steps | triggers {trigger_summary(wf)}")
-    notice("SAVED", [f"[white]{name}[/white] | {len(steps)} steps",
-                     f"triggers: [white]{trigger_summary(wf)}[/white]",
-                     f"[dim]{path}[/dim]"], "good")
+                   f"{flow['name']} | {len(steps)} steps | {trigger_summary(flow)}")
+    notice("WORKFLOW SAVED",
+           [f"[white]{flow['name']}[/white] | {len(steps)} op(s) chained.",
+            f"trigger: [white]{trigger_summary(flow)}[/white]",
+            f"[dim]{path}[/dim]"], "good")
+    return flow
 
 
 # ------------------------------------------------------------
-# PREVIEW
+# THE ONLY EDITS THAT EXIST: re-record one step's inputs, or delete
 # ------------------------------------------------------------
 
-def _preview_lines(ctx, index, steps, depth=0):
-    lines = []
-    for i, s in enumerate(steps):
-        pad = "    " * depth
-        label = describe_step(s, index)
-        slug = s.get("op") if step_kind(s) == "op" else None
-        tag = ""
-        if slug:
-            missing = missing_perms(slug, ctx)
-            limited = op_limitations(slug, ctx)
-            if missing:
-                tag = f" [bad]needs {'/'.join(missing)}[/bad]"
-            elif limited:
-                tag = f" [warn]limited | {limited}[/warn]"
-        lines.append(f"[orange]{i + 1:02d}[/orange]{pad} [white]{label}[/white]{tag}")
-        if step_kind(s) == "condition":
-            if s.get("then"):
-                lines.append(f"{pad}   [dim]then[/dim]")
-                lines += _preview_lines(ctx, index, s["then"], depth + 1)
-            if s.get("else"):
-                lines.append(f"{pad}   [dim]else[/dim]")
-                lines += _preview_lines(ctx, index, s["else"], depth + 1)
-        elif step_kind(s) == "loop":
-            if s.get("steps"):
-                lines.append(f"{pad}   [dim]x{int(s.get('times', 1))}[/dim]")
-                lines += _preview_lines(ctx, index, s["steps"], depth + 1)
-    return lines
-
-
-def show_preview(ctx, index, wf):
-    """Confirmation panel. Returns True when the user wants to run it."""
+def _rerecord_inputs(ctx, index, flows):
+    if not flows:
+        notice("NONE", ["no workflows saved yet."], "warn")
+        return False
+    for i, f in enumerate(flows, 1):
+        console.print(f"  [orange][{i}][/orange] [white]{f.get('name')}[/white] "
+                      f"[dim]{len(f.get('steps', []))} steps | {trigger_summary(f)}[/dim]")
+    raw = ask(f"which workflow 1-{len(flows)} | B back").lower().strip()
+    if raw in ("b", "", "q") or not raw.isdigit() or not 1 <= int(raw) <= len(flows):
+        return False
+    flow = flows[int(raw) - 1]
+    steps = flow.get("steps", [])
+    if not steps:
+        notice("EMPTY", ["that workflow has no steps."], "warn")
+        return False
     console.print()
-    plan = flatten_steps(wf.get("steps", []))
-    body = _preview_lines(ctx, index, wf.get("steps", []))
-    if not body:
-        body = ["[faint](no steps)[/faint]"]
-    meta = [
-        f"steps: [white]{len(plan)}[/white]"
-        f"   stop on error: [white]{'yes' if wf.get('stop_on_error', True) else 'no'}[/white]"
-        f"   triggers: [white]{trigger_summary(wf)}[/white]"
-        f"   target: [white]{(ctx.guild or {}).get('name', '?')}[/white]",
-    ]
-    console.print(
-        Panel(
-            "\n".join(body) + "\n\n" + "\n".join(f"[dim]{m}[/dim]" for m in meta),
-            title=f"[orange]WORKFLOW PREVIEW | {wf.get('name', '?')}[/orange]",
-            border_style="orange",
-            box=box.ROUNDED,
-            padding=(0, 1),
-        )
-    )
+    for i, s in enumerate(steps, 1):
+        console.print(f"  [orange][{i}][/orange] {describe_step(s, index)}")
+    raw = ask(f"which step 1-{len(steps)} | B back").lower().strip()
+    if raw in ("b", "", "q") or not raw.isdigit() or not 1 <= int(raw) <= len(steps):
+        return False
+    si = int(raw) - 1
+    step = steps[si]
+    if step.get("kind") != "op":
+        notice("NOT AN OP", ["only op steps carry inputs."], "warn")
+        return False
+    name = (index.get(step.get("op", "")) or {}).get("name", step.get("op", "?"))
+    step["answers"] = _record_answers(ctx, name)
+    save_workflow(flow)
+    ctx.logger.log("WORKFLOW_EDITED", f"{flow.get('name')} | step {si + 1} re-recorded")
+    notice("UPDATED",
+           [f"step {si + 1} of [white]{flow.get('name')}[/white] "
+            "now fires with the new answers."], "good")
+    return True
 
-    problems, limits = [], []
-    for sid, _, s in plan:
-        if step_kind(s) != "op":
-            continue
-        slug = s.get("op", "")
-        entry = index.get(slug)
-        name = entry["name"] if entry else slug
-        missing = missing_perms(slug, ctx)
-        if missing:
-            problems.append(f"[white]{name}[/white] | needs {', '.join(missing)} | skipped")
-        elif op_limitations(slug, ctx):
-            limits.append(f"[white]{name}[/white] | {op_limitations(slug, ctx)}")
 
-    if problems:
-        notice("WILL BE SKIPPED",
-               problems + ["", "the bot lacks these permissions on this guild.",
-                           "grant them, or remove the steps."], "bad")
-    if limits:
-        notice("MAY BE LIMITED",
-               limits + ["", "these depend on intents or the target's settings."], "warn")
-
-    if not problems and not limits and \
-            not (ctx.perms & PERMISSION_BITS["ADMINISTRATOR"]):
-        notice("NOT ADMINISTRATOR",
-               ["no step is blocked, but the bot holds no administrator.",
-                "single-target ops can still fail if the target outranks it."], "warn")
-
-    return confirm("run this workflow now?")
+def _delete_flow(ctx, flows):
+    if not flows:
+        notice("NONE", ["no workflows saved yet."], "warn")
+        return False
+    for i, f in enumerate(flows, 1):
+        console.print(f"  [orange][{i}][/orange] [white]{f.get('name')}[/white]")
+    raw = ask(f"which workflow 1-{len(flows)} | B back").lower().strip()
+    if raw in ("b", "", "q") or not raw.isdigit() or not 1 <= int(raw) <= len(flows):
+        return False
+    victim = flows[int(raw) - 1]
+    if not confirm(f"delete [white]{victim.get('name')}[/white]?"):
+        return False
+    if delete_workflow_file(victim.get("name", "")):
+        ctx.logger.log("WORKFLOW_DELETED", victim.get("name", "?"))
+        notice("DELETED", [f"{victim.get('name')} removed."], "good")
+        return True
+    notice("FAILED", ["file could not be removed."], "bad")
+    return False
 
 
 # ------------------------------------------------------------
-# EXECUTION
+# ENGINE SCREEN — the whole workflow UI fits in one loop
+# ------------------------------------------------------------
+
+def workflow_engine(ctx, *, index):
+    """List, run, new, re-record, delete. Nothing else."""
+    while True:
+        flows = load_workflows()
+        console.print()
+        screen_title("WORKFLOW ENGINE", "chained ops with pre-set inputs")
+        if not flows:
+            console.print("  [dim]no workflows yet. N makes one.[/dim]")
+        for i, f in enumerate(flows, 1):
+            steps = f.get("steps", [])
+            preset = sum(len(s.get("answers") or []) for s in steps)
+            console.print(
+                f"  [orange][{i}][/orange] [white]{f.get('name')}[/white] "
+                f"[dim]{len(steps)} ops | {preset} pre-set inputs | "
+                f"{trigger_summary(f)}[/dim]")
+            chain = " -> ".join(
+                (index.get(s.get("op", "")) or {}).get("name", s.get("op", "?"))
+                for s in steps if s.get("kind") == "op")
+            if chain:
+                console.print(f"      [dim]{chain[:200]}[/dim]")
+        console.print()
+        console.print("  [dim]# run | N new | E re-record step inputs | D delete | B back[/dim]")
+        raw = ask("action").strip()
+        low = raw.lower()
+        if low in ("b", "", "q"):
+            return
+        if low == "n":
+            create_workflow(ctx, index)
+            continue
+        if low == "e":
+            _rerecord_inputs(ctx, index, flows)
+            continue
+        if low == "d":
+            _delete_flow(ctx, flows)
+            continue
+        if low.isdigit() and 1 <= int(low) <= len(flows):
+            execute_workflow(ctx, index, flows[int(low) - 1])
+            press_enter()
+            continue
+        notice("OUT OF RANGE", ["pick a number, N, E, D, or B."], "warn")
+
+
+def page_ops():
+    """The WORKFLOWS page exposes exactly one entry: the engine itself."""
+    return [
+        ("Workflow Engine", "chained ops, pre-set inputs, one trigger", workflow_engine),
+    ]
+
+
+# ------------------------------------------------------------
+# EXECUTION — runs new chains and legacy files alike
 # ------------------------------------------------------------
 
 def _sleep_wait(board, seconds):
@@ -785,6 +643,8 @@ def _conditional_wait(ctx, board, step, cache):
             f"| {int(remaining) + 1}s left"
         )
         time.sleep(min(float(poll), remaining))
+
+
 
 
 def _run_steps(ctx, index, steps, path, board, by_id, taken, cache, state):
@@ -852,6 +712,9 @@ def _run_steps(ctx, index, steps, path, board, by_id, taken, cache, state):
                 ctx.logger.log("WF_SKIP", f"{entry['name']} | missing {','.join(missing)}")
                 continue
             board.suspend()
+            # Replay the answers recorded at build time. When the recording
+            # runs dry, prompts fall through to live input automatically.
+            set_input_feed(deque(step.get("answers") or []))
             try:
                 entry["fn"](ctx)
                 if bi is not None:
@@ -869,6 +732,7 @@ def _run_steps(ctx, index, steps, path, board, by_id, taken, cache, state):
                 ctx.logger.log("WF_ABORT", entry["name"])
                 return True
             finally:
+                set_input_feed(None)
                 board.resume()
             continue
 
@@ -915,6 +779,8 @@ def _run_steps(ctx, index, steps, path, board, by_id, taken, cache, state):
             board.skip(bi, "unknown kind")
 
     return False
+
+
 
 
 def execute_workflow(ctx, index, wf):
@@ -985,65 +851,12 @@ def execute_workflow(ctx, index, wf):
         ],
         "warn" if (aborted or counts["failed"]) else "good",
     )
-    press_enter()
 
 
 # ------------------------------------------------------------
 # TRIGGERS
 # ------------------------------------------------------------
 
-def _edit_triggers(ctx, wf):
-    """Toggle-based trigger editor. `wf` is mutated in place."""
-    triggers = normalize_triggers(wf)
-    while True:
-        console.print()
-        screen_title("SET TRIGGERS", f"{wf.get('name', '?')} | D done")
-        kinds = [k for k, _ in TRIGGER_KINDS]
-        for i, (kind, label) in enumerate(TRIGGER_KINDS):
-            active = next((t for t in triggers if t.get("kind") == kind), None)
-            if kind == "interval" and active:
-                label += f" [white](every {int(active.get('seconds', 300))}s)[/white]"
-            mark = "[orange][x][/orange]" if active else "[faint][ ][/faint]"
-            console.print(f"  {mark} [orange][{i + 1}][/orange] [white]{label}[/white]")
-        raw = ask("toggle | D done").lower().strip()
-        if raw in ("d", ""):
-            wf["triggers"] = triggers or [{"kind": "manual"}]
-            return wf
-        if raw.isdigit() and 1 <= int(raw) <= len(kinds):
-            kind = kinds[int(raw) - 1]
-            existing = next((t for t in triggers if t.get("kind") == kind), None)
-            if existing:
-                triggers.remove(existing)
-                # Removing manual while others stay is fine; removing the LAST
-                # trigger leaves manual, because a workflow must be reachable.
-                if not triggers:
-                    triggers.append({"kind": "manual"})
-                continue
-            if kind == "manual":
-                # Manual is mutually exclusive with everything automatic.
-                triggers = [{"kind": "manual"}]
-                continue
-            triggers = [t for t in triggers if t.get("kind") != "manual"]
-            entry = {"kind": kind}
-            if kind == "interval":
-                secs = ask_int("fire every how many seconds (min 30)", 300)
-                entry["seconds"] = max(30, secs)
-            triggers.append(entry)
-            continue
-        notice("OUT OF RANGE", [f"expected 1-{len(kinds)} | D done."], "warn")
-
-
-def set_triggers_ui(ctx, *, index=None):
-    screen_title("SET TRIGGERS", "choose a saved workflow")
-    wf = _pick_workflow(ctx, "edit triggers")
-    if wf is None:
-        return
-    _edit_triggers(ctx, wf)
-    path = save_workflow(wf)
-    ctx.logger.log("WORKFLOW_TRIGGERS", f"{wf.get('name')} | {trigger_summary(wf)}")
-    notice("SAVED", [f"[white]{wf.get('name')}[/white]",
-                     f"triggers: [white]{trigger_summary(wf)}[/white]",
-                     f"[dim]{path}[/dim]"], "good")
 
 
 def collect_due_workflows(ctx):
@@ -1100,99 +913,3 @@ def run_due_workflows(ctx, index):
         else:
             ctx.logger.log("WF_TRIGGER_DECLINED", wf.get("name", "?"))
     return ran
-
-
-# ------------------------------------------------------------
-# ENGINE SCREEN (V1-style)
-# ------------------------------------------------------------
-
-def _render_engine(ctx, flows):
-    print_header(ctx)
-    console.print()
-    console.print(grad("  Workflow Engine", ctx))
-    console.print()
-    console.print("    [orange][1][/orange] [white]Create Workflow[/white]")
-    console.print("    [orange][2][/orange] [white]Execute Workflow[/white]")
-    console.print("    [orange][3][/orange] [white]Delete Workflow[/white]")
-    console.print("    [orange][4][/orange] [white]Set Triggers[/white]")
-    console.print()
-    console.print("  [white]Saved workflows:[/white]")
-    if flows:
-        for wf in flows:
-            steps = len(flatten_steps(wf.get("steps", [])))
-            console.print(
-                f"    [white]{wf.get('name', '?')}[/white] [dim]— {steps} steps, "
-                f"triggers: {trigger_summary(wf)}[/dim]"
-            )
-    else:
-        console.print("    [faint](none yet | create one with [1])[/faint]")
-    console.print()
-    console.print("    [orange][0][/orange] [dim]Back[/dim]")
-    console.print()
-
-
-def workflow_engine(ctx, *, index):
-    """The V1-style engine menu that owns every workflow action."""
-    while True:
-        flows = load_workflows()
-
-        def render():
-            _render_engine(ctx, flows)
-
-        present_frame(ctx, render)
-        choice = ask("Select").lower().strip()
-        console.print()
-
-        if choice in ("0", "b", "q", ""):
-            return
-        if choice == "1":
-            create_workflow(ctx, index)
-            press_enter()
-            continue
-        if choice == "2":
-            wf = _pick_workflow(ctx)
-            if wf is not None and show_preview(ctx, index, wf):
-                execute_workflow(ctx, index, wf)
-            continue
-        if choice == "3":
-            delete_workflow_ui(ctx)
-            press_enter()
-            continue
-        if choice == "4":
-            set_triggers_ui(ctx, index=index)
-            press_enter()
-            continue
-        notice("OUT OF RANGE", ["0-4."], "warn")
-        press_enter()
-
-
-def delete_workflow_ui(ctx, *, index=None):
-    screen_title("DELETE WORKFLOW", "removes the saved chain file")
-    flows = load_workflows()
-    if not flows:
-        notice("NO WORKFLOWS", ["nothing to delete."], "warn")
-        return
-    for i, wf in enumerate(flows):
-        console.print(f"  [orange][{i + 1:02d}][/orange] [white]{wf.get('name')}[/white] "
-                      f"[dim]| {len(flatten_steps(wf.get('steps', [])))} steps | "
-                      f"{trigger_summary(wf)}[/dim]")
-    pick = ask(f"1-{len(flows)} delete | B back").lower()
-    if pick == "b":
-        return
-    if not (pick.isdigit() and 1 <= int(pick) <= len(flows)):
-        notice("OUT OF RANGE", [f"expected 1-{len(flows)}."], "warn")
-        return
-    victim = flows[int(pick) - 1]
-    if confirm(f"delete [white]{victim.get('name')}[/white]?"):
-        if delete_workflow_file(victim.get("name", "")):
-            ctx.logger.log("WORKFLOW_DELETED", victim.get("name", "?"))
-            notice("DELETED", [f"{victim.get('name')} removed."], "good")
-        else:
-            notice("FAILED", ["file could not be removed."], "bad")
-
-
-def page_ops():
-    """The WORKFLOWS page exposes exactly one entry: the engine itself."""
-    return [
-        ("Workflow Engine", "chained ops, waits, conditions, triggers", workflow_engine),
-    ]

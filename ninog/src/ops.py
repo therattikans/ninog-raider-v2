@@ -3984,7 +3984,7 @@ OP_INDEX = build_index(PAGES)
 PAGES.append(
     {
         "name": "WORKFLOWS",
-        "desc": "chain ops, waits and conditions",
+        "desc": "chained ops with pre-set inputs",
         "ops": [
             op(name, desc, partial(fn, index=OP_INDEX))
             for name, desc, fn in page_ops()
