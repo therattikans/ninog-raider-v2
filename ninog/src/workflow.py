@@ -1,5 +1,5 @@
 # ==============================================================
-#   NiNog Raker V2.4 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   src/workflow.py | workflow engine: chains, triggers
 # ==============================================================
 #
@@ -49,6 +49,7 @@ from .ui import (
     DONE,
     FAILED,
     PENDING,
+    RUNNING,
     SKIPPED,
     TodoBoard,
     ask,
@@ -88,8 +89,8 @@ OP_PERMISSIONS = {
     "unban_all": ["BAN_MEMBERS"],
     "unban_member": ["BAN_MEMBERS"],
     "view_ban_list": ["BAN_MEMBERS"],
-    "whitelist_ban": ["BAN_MEMBERS"],
-    "whitelist_unban": ["BAN_MEMBERS"],
+    "mass_ban": ["BAN_MEMBERS"],
+    "mass_unban": ["BAN_MEMBERS"],
     "kick_all": ["KICK_MEMBERS"],
     "kick_member": ["KICK_MEMBERS"],
     "change_server_name": ["MANAGE_GUILD"],
@@ -924,7 +925,9 @@ def execute_workflow(ctx, index, wf):
         return
 
     by_id = {sid: i for i, (sid, _, _) in enumerate(plan)}
-    titles = ["    " * depth + describe_step(s, index) for _, depth, s in plan]
+    # (depth, title) pairs — the board owns indentation; pre-indenting here
+    # fed strings into an unpack that killed every run in a live terminal.
+    titles = [(depth, describe_step(s, index)) for _, depth, s in plan]
     taken = set()
     cache = {}
     state = {
@@ -958,7 +961,14 @@ def execute_workflow(ctx, index, wf):
 
     counts = {DONE: 0, SKIPPED: 0, FAILED: 0, PENDING: 0}
     for i in range(len(plan)):
-        counts[board.state(i)] += 1
+        st = board.state(i)
+        if st == RUNNING:
+            # Interrupt or engine fault landed mid-step: the run is over, so
+            # the step never finished and counts as never reached. Without
+            # this remap the tally itself raised KeyError and Ctrl+C during
+            # any workflow crashed the whole session page.
+            st = PENDING
+        counts[st] = counts.get(st, 0) + 1
 
     ctx.logger.log(
         "WF_DONE",

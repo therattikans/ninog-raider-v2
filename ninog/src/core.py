@@ -1,5 +1,5 @@
 # ==============================================================
-#   NiNog Raker V2.3 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   src/core.py | identity, paths, config, report log,
 #                vault + whitelist persistence, REST client
 # ==============================================================
@@ -28,7 +28,7 @@ import requests
 # ------------------------------------------------------------
 
 TOOL_NAME = "NiNog Raker"
-TOOL_VERSION = "2.4"
+TOOL_VERSION = "2.0"
 MAINTAINER = "THE RATTIKANS"
 MAINTAINER_CONTACT = "discord username: therattikans."
 MAINTAINER_SERVER = "https://discord.gg/M2fGay6MVn"
@@ -886,7 +886,18 @@ def fetch_online_ids(token, guild_id, timeout=8.0):
                     "wss://gateway.discord.gg/?v=10&encoding=json",
                     max_size=8 * 1024 * 1024) as ws:
                 hello = json.loads(await ws.recv())
-                heartbeat = (hello.get("d") or {}).get("heartbeat_interval", 40000) / 1000.0
+                interval = (hello.get("d") or {}).get("heartbeat_interval", 40000) / 1000.0
+
+                async def _heart():
+                    # The gateway drops any client that misses a heartbeat.
+                    try:
+                        while True:
+                            await asyncio.sleep(interval)
+                            await ws.send(json.dumps({"op": 1, "d": None}))
+                    except Exception:
+                        return
+
+                asyncio.ensure_future(_heart())
                 await ws.send(json.dumps({
                     "op": 2,
                     "d": {
@@ -898,7 +909,7 @@ def fetch_online_ids(token, guild_id, timeout=8.0):
                 await ws.send(json.dumps({
                     "op": 14,
                     "d": {"guild_id": str(guild_id), "query": "", "limit": 0,
-                          "presences": True, "user_ids": None},
+                          "presences": True},
                 }))
                 import asyncio as _a
                 end = _a.get_event_loop().time() + timeout
@@ -948,6 +959,49 @@ import hashlib
 import traceback as _traceback_mod
 
 TOKEN_RELIEF_RE = re.compile(r"[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{20,}")
+# A webhook URL's last path segment is its token; everything before it is
+# safe to keep because the id alone cannot execute the hook.
+WEBHOOK_TOKEN_RE = re.compile(
+    r"(discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9_\-]{10,}")
+_SECRET_KEY_HINTS = ("token", "secret", "pass", "session", "auth")
+
+
+def _secret_values(node):
+    """Literal secret strings from a config tree (values under key hints)."""
+    found = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if any(h in str(k).lower() for h in _SECRET_KEY_HINTS):
+                if isinstance(v, str) and len(v) >= 10:
+                    found.append(v)
+                else:
+                    found.extend(_secret_values(v))
+            else:
+                found.extend(_secret_values(v))
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            found.extend(_secret_values(v))
+    return found
+
+
+def mask_secret_text(text, config=None):
+    """Make free text safe to ship in a crash bundle.
+
+    Layers: Discord bot-token shapes, webhook-url tokens, then any literal
+    secret value the live config holds (covers vault formats the regex
+    cannot guess). Static earlier versions only scrubbed config_snapshot/
+    files — error.txt's settings dump and the copied session logs went
+    out raw, which is how real tokens escaped inside 'debug' bundles.
+    """
+    text = str(text)
+    text = TOKEN_RELIEF_RE.sub(
+        lambda m: m.group(0)[:6] + "...(REDACTED)...", text)
+    text = WEBHOOK_TOKEN_RE.sub(r"\1(REDACTED)", text)
+    if config is not None:
+        data = getattr(config, "data", None)
+        for sec in _secret_values(data):
+            text = text.replace(sec, sec[:4] + "...(REDACTED)...")
+    return text
 
 
 def sha256_file(path):
@@ -995,7 +1049,7 @@ def _redact_config_bytes(path, raw):
             return json.dumps(data, indent=2).encode("utf-8")
         except Exception:
             pass  # corrupt JSON: fall through to regex masking
-    return TOKEN_RELIEF_RE.sub(lambda m: m.group(0)[:6] + "...(REDACTED)...", text).encode("utf-8", "replace")
+    return mask_secret_text(text).encode("utf-8", "replace")
 
 
 def build_crash_report(exc_type, exc, tb, ctx=None, origin="uncaught"):
@@ -1045,7 +1099,9 @@ def build_crash_report(exc_type, exc, tb, ctx=None, origin="uncaught"):
         if lim is not None:
             lines.append(f"rate limit: {json.dumps(lim.snapshot())}")
         lines.append(f"alert queue: {ctx.pending_alerts!r}")
-    (report / "error.txt").write_text("\n".join(lines), encoding="utf-8")
+    (report / "error.txt").write_text(
+        mask_secret_text("\n".join(lines), getattr(ctx, "config", None)),
+        encoding="utf-8")
 
     # -- source/: verbatim copies + sha256 manifest --------------------
     manifest = {}
@@ -1085,7 +1141,10 @@ def build_crash_report(exc_type, exc, tb, ctx=None, origin="uncaught"):
     # -- session_logs/: everything the report logger produced ----------
     try:
         for path in sorted(REPORTLOG_DIR.glob("*.log")):
-            (log_dir / path.name).write_bytes(path.read_bytes())
+            raw = path.read_bytes().decode("utf-8", "replace")
+            (log_dir / path.name).write_text(
+                mask_secret_text(raw, getattr(ctx, "config", None)),
+                encoding="utf-8")
     except OSError:
         pass
 

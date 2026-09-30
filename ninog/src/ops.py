@@ -1,5 +1,5 @@
 # ==============================================================
-#   NiNog Raker V2.3 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   src/ops.py | every interactive flow and operation
 # ==============================================================
 #
@@ -471,7 +471,7 @@ def _op_crash_report(ctx, exc, origin):
         [
             f"[white]{type(exc).__name__}[/white]: {str(exc)[:150]}",
             "",
-            f"a full report was written to:",
+            "a full report was written to:",
             f"[white]{report}[/white]",
             "",
             f"send it to {MAINTAINER_CONTACT}",
@@ -910,7 +910,7 @@ def restore_settings(ctx, blob, channel_map, role_map):
     ok = r.status_code == 200
     ctx.logger.log("OP_RESULT", f"restore_settings | {r.status_code}")
     console.print(
-        f"[dim]settings |[/dim] "
+        "[dim]settings |[/dim] "
         + ("[good]applied[/good]" if ok else f"[bad]failed ({r.status_code})[/bad]")
     )
     return ok
@@ -959,7 +959,7 @@ def restore_onboarding(ctx, blob, channel_map, role_map):
     r = rest.put_onboarding(gid, body)
     ctx.logger.log("OP_RESULT", f"restore_onboarding | {r.status_code}")
     console.print(
-        f"[dim]onboarding |[/dim] "
+        "[dim]onboarding |[/dim] "
         + ("[good]applied[/good]" if r.status_code == 200
            else f"[warn]failed ({r.status_code})[/warn]")
     )

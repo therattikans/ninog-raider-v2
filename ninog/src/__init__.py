@@ -1,5 +1,5 @@
 # ==============================================================
-#   NiNog Raker V2.3 | THE RATTIKANS
+#   NiNog Raker v2.0 | THE RATTIKANS
 #   src package marker
 #
 #   Import order is strict and load-bearing:

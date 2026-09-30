@@ -1,4 +1,4 @@
-# NiNog Raker v2.4 | THE RATTIKANS
+# NiNog Raker v2.0 | THE RATTIKANS
 
 Discord guild administration and anti-nuke testing tool. Drives a bot token
 through the REST API to manage servers, run raid simulations against your own
@@ -16,7 +16,7 @@ cd ninog && python main.py
 `config/`, `snapshots/`, `reportlog/` and `exports/` are created on demand
 next to `main.py` and are git-ignored.
 
-## What's inside (v2.4)
+## What's inside (v2.0)
 
 - **Role Engine** (replaces Get Admin): build a permission profile — admin,
   moderator, channel manager, custom bit-toggles — and apply it to *anyone*:
@@ -65,3 +65,14 @@ ninog/
     ├── workflow.py  workflow engine: chains, conditions, triggers
     └── ops.py       every interactive flow and operation
 ```
+
+## Testing
+
+```bash
+python tests/integration_test.py
+```
+
+The offline regression suite (33 checks) drives every interactive flow —
+role engine, webhook extraction/relay/export, workflow engine + triggers,
+crash bundles, watchdog, narrow-terminal rendering, rate-limit retries —
+against a scripted terminal and a fake Discord REST end. No token needed.
