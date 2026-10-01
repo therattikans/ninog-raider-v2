@@ -33,6 +33,7 @@ from collections import deque
 
 from .core import (
     PERMISSION_BITS,
+    WHITELIST_FILE,
     WORKFLOWS_DIR,
     ApiNetworkError,
 )
@@ -52,11 +53,12 @@ from .ui import (
     sanitize_name,
     screen_title,
     set_input_feed,
+    start_prompt_recorder,
+    stop_prompt_recorder,
 )
 
 MAX_LOOP_TIMES = 50          # per-loop pass cap in legacy files; the chain has no cap
 EXCLUDED_SLUGS = {"workflow_engine"}   # the manager can never chain itself
-MAX_RECORDED_ANSWERS = 200   # sane ceiling when scripting an op's inputs
 
 # ------------------------------------------------------------
 # PERMISSION MODEL + INDEX
@@ -385,127 +387,151 @@ def delete_workflow_file(name):
     return False
 
 
-# What each chainable op asks, in the order it asks it. This is a GUIDE
-# for the builder -- shown so the user knows which question each recorded
-# answer serves. Replays match answers to prompts by position; if a live
-# server state makes an op ask extra questions (pickers, paged lists),
-# those simply get asked at run time, so an imperfect guide costs nothing.
-PROMPT_GUIDE = {
-    "ban_all": ["confirm ban every member (y/n)"],
-    "ban_member": ["pick the member (picker: whitelist / server / username / id)",
-                   "delete message history days (0-7)", "confirm ban (y/n)"],
-    "rename_server": ["new server name", "confirm rename (y/n)"],
-    "flood_channels": ["channel name", "how many", "type (0 text / 2 voice)",
-                       "confirm create (y/n)"],
-    "flood_roles": ["role name", "how many", "color hex (blank = default)",
-                    "confirm create (y/n)"],
-    "wipe_channels": ["confirm delete ALL channels (y/n)"],
-    "wipe_roles": ["confirm delete ALL deletable roles (y/n)"],
-    "mass_kick": ["confirm kick the members (y/n)"],
-    "kick_member": ["pick the member (picker)", "confirm kick (y/n)"],
-    "role_engine": ["targets: 1 whitelist | 2 handpick-wl | 3 handpick-server | 4 everyone | 5 everyone-except | 6 one user",
-                    "(handpick modes) picker answers",
-                    "perm preset: 1 admin | 2 moderator | 3 channel mgr | 4 view | 5 custom",
-                    "(custom) permission toggle numbers, then D",
-                    "delivery: 1 one shared role | 2 role per user",
-                    "role name (blank = random)",
-                    "color hex, R random, or blank",
-                    "hoist on member list? (y/n)",
-                    "confirm execute (y/n)"],
-    "server_info": [],
-    "unban_all": ["confirm unban all (y/n)"],
-    "create_invite": [],
-    "create_webhooks": ["webhook name", "webhooks per channel", "confirm create (y/n)"],
-    "dm_all": ["message to DM every human member", "confirm DM count (y/n)"],
-    "delete_all_webhooks": ["confirm delete ALL webhooks (y/n)"],
-    "extract_webhooks": ["delivery: 1 display | 2 clipboard | 3 relay | 4 file | B done",
-                         "(relay) destination webhook url",
-                         "(loops for more deliveries) B to finish"],
-    "purge_messages": ["confirm purge text channels (y/n)",
-                       "(optional) channel # to limit scope | B for all"],
-    "send_message": ["channel # from the list", "message content"],
-    "webhook_spam": ["message to spam", "sends per webhook", "confirm send (y/n)"],
-    "channel_control": ["channel # to manage | C create | B done",
-                        "(create) channel name",
-                        "(create) type: 0 text | 2 voice | 4 category",
-                        "action: R rename | D delete | B back",
-                        "(rename) new name",
-                        "(delete) confirm (y/n)"],
-    "role_control": ["role # to manage | C create | B done",
-                     "(create) role name",
-                     "(create) color hex (blank = default)",
-                     "action: R rename | D delete | B back",
-                     "(rename) new name",
-                     "(delete) confirm (y/n)",
-                     "(perms) toggle numbers | A all | N none | D done"],
-    "add_by_id": ["user id", "(if it cannot be verified) use it anyway? (y/n)"],
-    "whitelist_add_id": ["user id", "(if it cannot be verified) use it anyway? (y/n)"],
-    "add_by_username": ["username to search", "pick # from the matches"],
-    "whitelist_add_search": ["username to search", "pick # from the matches"],
-    "add_from_dms": ["pick # from the DM list"],
-    "whitelist_add_dms": ["pick # from the DM list"],
-    "remove_entries": ["checkbox numbers to remove | D done", "confirm remove (y/n)"],
-    "whitelist_remove": ["checkbox numbers to remove | D done", "confirm remove (y/n)"],
-    "mass_ban": ["select from whitelist (picker menu)", "confirm ban (y/n)"],
-    "mass_unban": ["select from whitelist (picker menu)", "confirm unban (y/n)"],
-    "dm_invite": ["select from whitelist (picker menu)", "confirm send (y/n)"],
-    "dm_message": ["select from whitelist (picker menu)", "message text"],
-    "snapshot_now": [],
-    "browse_snapshots": ["snapshot # to view | B done"],
-    "delete_snapshot": ["snapshot # to delete", "confirm delete (y/n)"],
-    "restore_full": ["snapshot # from the list", "confirm restore (y/n)"],
-    "restore_roles": ["snapshot # from the list", "confirm restore (y/n)"],
-    "restore_channels": ["snapshot # from the list", "confirm restore (y/n)"],
-    "restore_settings": ["snapshot # from the list", "confirm restore (y/n)"],
-    "member_lookup": ["pick the member (picker)"],
-    "scan_bots": [],
-    "unban_member": ["ban entry # from the list | B back"],
-    "view_ban_list": ["N next | P prev | B done"],
-    "diagnoser": [],
-    "report_explorer": ["entry # to open | N/P pages | D n delete | B done"],
-    "support_bundle": ["confirm build bundle (y/n)"],
-}
-
 # ------------------------------------------------------------
-# ANSWER RECORDER — pre-set the op's inputs for when it fires
+# WALKTHROUGH RECORDER — configure the op as if it were firing
 # ------------------------------------------------------------
+# V1's model, done properly: when a step is added, the tool runs the op's
+# real flow against the real server — same questions, same pickers, real
+# member/channel lists — while two guards make it safe and capture the
+# configuration:
+#
+#   _RehearsalREST    every read (get_*) goes to Discord like normal,
+#                     every write (create/delete/patch/ban/kick/send/
+#                     webhook...) returns a canned success and never
+#                     leaves the machine.
+#   prompt recorder   ui.ask/confirm capture (question, raw answer)
+#
+# What survives a walkthrough is exactly the answer list, replayed at
+# fire time. Nothing else. No static question maps.
 
-def _record_answers(ctx, op_name, slug=None):
-    """Capture the answers an op will need, labeled by the question they serve."""
-    console.print()
-    screen_title(f"PRE-SET INPUTS | {op_name}", "answer its questions once, right here")
-    guide = PROMPT_GUIDE.get(slug or "", []) or []
-    if guide:
-        console.print("  [white]this op asks, in order:[/white]")
-        for i, q in enumerate(guide, 1):
-            console.print(f"    [dim]{i}.[/dim] {q}")
-    else:
-        console.print("  [white]this op asks nothing.[/white] it fires with no inputs.")
-    console.print()
-    console.print("  [dim]Enter one answer per question below, in the same order.[/dim]")
-    console.print("  [dim]Blank = the op's default. END on its own line finishes early.[/dim]")
+class _CannedR:
+    """requests.Response stand-in for swallowed writes."""
 
-    answers, labels = [], []
-    n = 0
-    while n < MAX_RECORDED_ANSWERS:
-        label = guide[n] if n < len(guide) else f"extra answer #{n + 1}"
-        if not guide and n == 0:
-            break
-        raw = ask(f"  {n + 1}. {label}")
-        if raw is None or str(raw).strip().upper() == "END":
-            break
-        answers.append(raw)
-        labels.append(label)
-        n += 1
-    if answers:
-        notice("RECORDED",
-               [f"[white]{len(answers)}[/white] answer(s) locked in for [white]{op_name}[/white].",
-                "the op fires hands-free. anything you skipped gets asked live."])
-    else:
-        notice("NOTHING RECORDED",
-               [f"[white]{op_name}[/white] will ask its questions live when it fires."]
-               if guide else
-               [f"[white]{op_name}[/white] needs no inputs. ready to fire."],)
+    def __init__(self, status, payload=None):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.headers = {}
+        self.text = json.dumps(self._payload)
+
+    def json(self):
+        return self._payload
+
+
+class _SilentLogger:
+    def log(self, *a, **k):
+        pass
+
+
+class _RehearsalREST:
+    """Read-through, write-swallow wrapper around the live REST client."""
+
+    _READ_EXTRA = {"download"}
+
+    def __init__(self, real):
+        self._real = real
+        self.limiter = getattr(real, "limiter", None)
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if not callable(attr):
+            return attr
+        if name.startswith("get_") or name in self._READ_EXTRA:
+            return attr
+        if name == "request":  # generic escape hatch: GET passes, rest canned
+            def _guarded(method, path, **kwargs):
+                if str(method).upper() == "GET":
+                    return attr(method, path, **kwargs)
+                return _CannedR(204)
+            return _guarded
+        return lambda *a, **k: self._canned(name, a, k)
+
+    @staticmethod
+    def _canned(name, args, kwargs):
+        rid = f"999{int(time.time() * 1000) % 10**12:012d}"
+        body = {}
+        for a in args:
+            if isinstance(a, dict):
+                body = a
+        for v in kwargs.values():
+            if isinstance(v, dict):
+                body = v
+        if name in ("create_role", "create_channel"):
+            return _CannedR(200, dict(body, id=rid))
+        if name == "create_webhook":
+            return _CannedR(200, {"id": rid, "token": "rehearsal-token"})
+        if name == "create_dm":
+            return _CannedR(200, {"id": rid})
+        if name == "create_invite":
+            return _CannedR(200, {"code": "rehearsal"})
+        if name == "send_message":
+            return _CannedR(200, {"id": rid})
+        return _CannedR(204)
+
+
+def _walkthrough(ctx, slug, entry):
+    """Run the op like it's firing; keep only the answers. Returns
+    (answers, labels) or None when the walkthrough was declined/aborted."""
+    name = entry["name"]
+    notice("WALKTHROUGH | NOTHING IS SENT",
+           [f"configure [white]{name}[/white] exactly as if it were firing",
+            "right now: same questions, same pickers, real server data.",
+            "",
+            "every ban, kick, delete, create, rename, message and webhook",
+            "call is swallowed by the engine — only your answers are kept."],
+           "warn")
+    if not confirm(f"walk through [white]{name}[/white] now?", True):
+        return None
+
+    real_rest = ctx.rest
+    real_logger = ctx.logger
+    wl_backup = WHITELIST_FILE.read_bytes() if WHITELIST_FILE.exists() else None
+    snap_flag = ctx.config.data.get("auto_snapshot", True)
+    ctx.config.data["auto_snapshot"] = False
+    ctx.rest = _RehearsalREST(real_rest)
+    ctx.logger = _SilentLogger()
+    start_prompt_recorder()
+    aborted = None
+    try:
+        entry["fn"](ctx)
+    except ApiNetworkError as e:
+        aborted = f"network error: {e}"
+    except KeyboardInterrupt:
+        aborted = "interrupted"
+    except Exception as e:
+        aborted = f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        transcript = stop_prompt_recorder()
+        ctx.rest = real_rest
+        ctx.logger = real_logger
+        ctx.config.data["auto_snapshot"] = snap_flag
+        # Undo any local-state churn (whitelist adds/removals during the
+        # walkthrough) the mutation guard could not see.
+        if wl_backup is None:
+            if WHITELIST_FILE.exists():
+                WHITELIST_FILE.unlink()
+        else:
+            WHITELIST_FILE.write_bytes(wl_backup)
+
+    if aborted:
+        notice("WALKTHROUGH ABORTED",
+               [aborted, "no answers were kept for this step."], "warn")
+        ctx.logger.log("WF_WALKTHROUGH_ABORT", f"{slug} | {aborted}")
+        return None
+
+    picked = [q for q in transcript if q[0] in ("ask", "confirm", "ask_int")]
+    answers = [a for _, _, a in picked]
+    labels = [q for _, q, _ in picked]
+
+    console.print()
+    screen_title(f"INPUTS CAPTURED | {name}", "what the fire will answer")
+    if not answers:
+        console.print("  [dim]the op asked nothing — it fires with no inputs.[/dim]")
+    for i, (lab, ans) in enumerate(zip(labels, answers), 1):
+        short = lab if len(lab) <= 62 else lab[:59] + "..."
+        console.print(f"    [dim]{i:02d}.[/dim] {short}")
+        console.print(f"        [orange]=[/orange] [white]{ans!r}[/white]")
+    if answers and not confirm(f"keep these {len(answers)} answers for this step?", True):
+        return None
     return answers, labels
 
 
@@ -593,10 +619,12 @@ def create_workflow(ctx, index):
         if picked is None:
             break
         slug, entry = picked
-        # The contract: options are chosen NOW, for when it fires — never
-        # invented mid-run. Labels ride along so the re-record screen can
-        # show which question each stored answer serves.
-        answers, labels = _record_answers(ctx, entry["name"], slug)
+        # The contract (V1's): the op is configured NOW, by walking its
+        # real flow with writes swallowed. Fire time only replays answers.
+        got = _walkthrough(ctx, slug, entry)
+        if got is None:
+            continue
+        answers, labels = got
         step = {"kind": "op", "op": slug, "answers": answers}
         if labels:
             step["labels"] = labels
@@ -657,7 +685,15 @@ def _rerecord_inputs(ctx, index, flows):
             console.print(f"    [dim]{i + 1}.[/dim] {lab}  [orange]=[/orange] [white]{a!r}[/white]")
     else:
         console.print("  [dim]nothing stored yet — this op asks live when it fires.[/dim]")
-    answers, labels = _record_answers(ctx, name, step.get("op"))
+    entry = index.get(step.get("op", "")) or {}
+    if not callable(entry.get("fn")):
+        notice("UNKNOWN OP", ["this step points at an op that no longer exists."], "bad")
+        return False
+    got = _walkthrough(ctx, step.get("op", ""), entry)
+    if got is None:
+        notice("UNCHANGED", ["kept the previously stored answers."], "warn")
+        return False
+    answers, labels = got
     step["answers"] = answers
     if labels:
         step["labels"] = labels

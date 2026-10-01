@@ -725,6 +725,30 @@ def _fed():
     except IndexError:
         return None
 
+
+# Walkthrough recorder: while a workflow step is being configured, every
+# live prompt captures (kind, prompt text, raw answer). This is how the
+# builder learns the op's answers WITHOUT a static question map — the op
+# itself drives, exactly as if it were firing.
+_PROMPT_RECORDER = None
+
+
+def start_prompt_recorder():
+    global _PROMPT_RECORDER
+    _PROMPT_RECORDER = []
+
+
+def stop_prompt_recorder():
+    global _PROMPT_RECORDER
+    out = _PROMPT_RECORDER or []
+    _PROMPT_RECORDER = None
+    return out
+
+
+def _record_prompt(kind, prompt, answer):
+    if _PROMPT_RECORDER is not None:
+        _PROMPT_RECORDER.append((kind, _plain(str(prompt)), str(answer)))
+
 def ask(text, default=None):
     show_default = default not in (None, "")
     prompt = f"[orange]{text}[/orange]"
@@ -738,7 +762,8 @@ def ask(text, default=None):
     try:
         raw = input().strip()
     except EOFError:
-        return "" if default is None else default
+        raw = ""
+    _record_prompt("ask", text, raw)
     if not raw:
         return "" if default is None else default
     return raw
@@ -781,7 +806,9 @@ def confirm(text, default=False):
                 raw = input().strip().lower()
             except EOFError:
                 console.print()
+                _record_prompt("confirm", text, "y" if default else "n")
                 return default
+            _record_prompt("confirm", text, raw)
         if not raw:
             console.print()
             return default
