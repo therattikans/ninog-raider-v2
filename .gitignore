@@ -4,3 +4,6 @@ ninog/reportlog/
 ninog/exports/
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
+.coverage

@@ -1,9 +1,6 @@
 # NiNog Raker v2.0 | THE RATTIKANS
 
-Thanks for waiting, here it is.
-
-# ⚠️ We didn't want to keep you waiting for too long, so we performed multiple minimal tests that may not have covered everything, expect bugs.
-# If you experience an error or bug, please report it in the Issues tab of our main repo.
+A terminal toolkit for Discord guild administration, snapshots, restores, workflows, and bulk operations.
 
 > **New to this?** Skip straight to your device: [Android (Termux)](#-android-termux) · [Windows](#-windows) · [Linux](#-linux) · [macOS](#-macos). Every step is copy-paste. You don't need to know how to code.
 
@@ -30,7 +27,7 @@ Thanks for waiting, here it is.
 | Thing | Why |
 |---|---|
 | **Python 3.10 or newer** | The source of this tool is written in Python |
-| **3 packages:** `rich`, `pyfiglet`, `requests` | Colors, banner, and network. |
+| **4 packages:** `rich`, `pyfiglet`, `requests`, `websockets` | Terminal UI, network access, and presence sorting. |
 | **The script files** | Downloaded from this repo |
 | **A terminal** | The black window where you type commands (each section below tells you which one) |
 
@@ -77,19 +74,18 @@ pkg install -y python git
 ```bash
 git clone https://github.com/therattikans/ninog-raider-v2.git
 cd ninog-raider-v2
-cd ninog
 ```
 
 ### 4. Install the packages
 
 ```bash
-pip install rich pyfiglet requests
+pip install -r requirements.txt
 ```
 
 ### 5. Run it
 
 ```bash
-python main.py
+python ninog/main.py
 ```
 
 ### Termux tips
@@ -133,13 +129,13 @@ A black window opens, already in the right place.
 ### 4. Install the packages
 
 ```bat
-pip install rich pyfiglet requests
+pip install -r requirements.txt
 ```
 
 If `pip` isn't recognized, try:
 
 ```bat
-py -m pip install rich pyfiglet requests
+py -m pip install -r requirements.txt
 ```
 
 ### 5. Run it
@@ -187,14 +183,13 @@ sudo pacman -S --needed python python-pip git
 ```bash
 git clone https://github.com/therattikans/ninog-raider-v2.git
 cd ninog-raider-v2
-cd ninog
 ```
 
 ### 3. Install the packages
 
 **Simple way:**
 ```bash
-pip3 install rich pyfiglet requests
+pip3 install -r requirements.txt
 ```
 
 **If you see `externally-managed-environment`** (new Debian/Ubuntu/Kali), use a virtual environment. It's cleaner anyway:
@@ -202,7 +197,7 @@ pip3 install rich pyfiglet requests
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install rich pyfiglet requests
+pip install -r requirements.txt
 ```
 
 Every time you open a new terminal, run `source .venv/bin/activate` inside the repo folder before starting the script.
@@ -225,8 +220,7 @@ python3 ninog/main.py
 brew install python git
 git clone https://github.com/therattikans/ninog-raider-v2.git
 cd ninog-raider-v2
-cd ninog
-pip3 install rich pyfiglet requests
+pip3 install -r requirements.txt
 python3 ninog/main.py
 ```
 
@@ -239,14 +233,7 @@ If pip complains about `externally-managed-environment`, use the virtual environ
 From the repo root:
 
 ```bash
-python main.py
-```
-
-or from inside the folder:
-
-```bash
-cd ninog
-python main.py
+python ninog/main.py
 ```
 
 > On Linux, macOS, and Termux you may need `python3` instead of `python`. On Windows, `py` also works.
@@ -277,7 +264,7 @@ If you cloned with Git:
 ```bash
 cd ninog-raider-v2
 git pull
-pip install --upgrade rich pyfiglet requests
+pip install --upgrade -r requirements.txt
 ```
 
 If you downloaded the ZIP, download the new ZIP and replace the files. Copy your old `config/` folder into the new one to keep your settings.
@@ -289,9 +276,9 @@ If you downloaded the ZIP, download the new ZIP and replace the files. Copy your
 | Problem | Fix |
 |---|---|
 | `python: command not found` | Try `python3` (Linux/macOS/Termux) or `py` (Windows). On Windows, reinstall Python and tick **Add to PATH** |
-| `pip: command not found` | Use `python -m pip install rich pyfiglet requests` (or `python3 -m pip ...`) |
+| `pip: command not found` | Use `python -m pip install -r requirements.txt` (or `python3 -m pip ...`) |
 | `ModuleNotFoundError: No module named 'rich'` (or `pyfiglet` / `requests`) | Packages didn't install. Rerun the `pip install` line. If you use a venv, make sure it's activated |
-| `can't open file '.../ninog-raider-v2/main.py'` | You're in the wrong folder. Run `ls` (or `dir` on Windows). You should see the `ninog` folder. `cd` into the ninog folder. |
+| `can't open file '.../ninog-raider-v2/main.py'` | Run from the repository root with `python ninog/main.py`. `ls` (or `dir`) should show both `ninog` and `requirements.txt`. |
 | `externally-managed-environment` | Use the virtual environment steps in the Linux section |
 | Banner/colors look broken | Use a modern terminal (Windows Terminal, Termux, any Linux terminal). On Windows try `chcp 65001` |
 | `Permission denied` | Don't use `sudo` with pip. Use a venv or `pip install --user ...` |

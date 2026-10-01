@@ -10,7 +10,6 @@ import pyfiglet
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
@@ -445,11 +444,11 @@ class RakerConsole(Console):
 
 console = RakerConsole(
     theme=theme_from_name("rattikans"),
-    force_terminal=True,
     highlight=False,
 )
 
 _CTX = None
+_THEME_PUSHED = False
 
 
 def set_context(ctx):
@@ -458,8 +457,12 @@ def set_context(ctx):
 
 
 def apply_theme(ctx):
+    global _THEME_PUSHED
+    if _THEME_PUSHED:
+        console.pop_theme()
     name = ctx.config.setting("theme", "rattikans")
     console.push_theme(theme_from_name(name), inherit=True)
+    _THEME_PUSHED = True
 
 
 # ------------------------------------------------------------
@@ -650,11 +653,15 @@ def figlet_art():
 
 
 def print_header(ctx):
-    console.print(grad(figlet_art(), ctx))
+    pacing = bool(ctx.config.setting("rate_limit", True))
+    rate = "[good]paced[/good]" if pacing else "[bad]unpaced[/bad]"
+    theme = ctx.config.setting("theme", "rattikans")
+    console.print(divider())
     console.print(
-        f"[white]{TOOL_NAME} v{TOOL_VERSION}[/white] [dim]|[/dim] [orange]{MAINTAINER}[/orange]"
+        f"[brand]{TOOL_NAME.upper()}[/brand] [white]v{TOOL_VERSION}[/white]"
+        f"  [dim]{MAINTAINER}[/dim]  [deep]•[/deep]  {rate}"
+        f"  [deep]•[/deep]  [dim]{theme}[/dim]"
     )
-    console.print("[dim]RATELIMIT: ON[/dim]")
     console.print(divider())
 
 
@@ -731,6 +738,11 @@ def ask(text, default=None):
 
 def ask_password(text):
     console.print(f"[orange]{text}[/orange] [white]›[/white]", end=" ")
+    if not sys.stdin.isatty():
+        try:
+            return input().strip()
+        except EOFError:
+            return ""
     try:
         return getpass.getpass("").strip()
     except Exception:

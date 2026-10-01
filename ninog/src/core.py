@@ -17,9 +17,11 @@ import platform
 import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -69,7 +71,7 @@ def ensure_directories():
 class ReportLogger:
     def __init__(self):
         REPORTLOG_DIR.mkdir(exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
         self.path = REPORTLOG_DIR / f"session_{stamp}.log"
         self.actions = 0
 
@@ -94,10 +96,10 @@ DEFAULT_CONFIG = {
     "settings": {
         "auto_snapshot": True,
         "page_size": 10,
-        "transition": "mercury",
-        "transition_ms": 350,
+        "transition": "none",
+        "transition_ms": 0,
         "theme": "rattikans",
-        "layout": "panels",
+        "layout": "list",
         "gradient": False,
         # --- client-side rate limiting ---
         "rate_limit": True,
@@ -117,36 +119,55 @@ DEFAULT_CONFIG = {
 }
 
 
+def _atomic_json(path, data, private=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        if private and os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 class Config:
     def __init__(self):
         self.first_run = not CONFIG_FILE.exists()
         if self.first_run:
             self.data = json.loads(json.dumps(DEFAULT_CONFIG))
             self.data["created"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.save()
         else:
             try:
-                self.data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                CONFIG_FILE.rename(CONFIG_FILE.with_suffix(".corrupt.json"))
+                loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("config root must be an object")
+                self.data = loaded
+            except (OSError, ValueError, json.JSONDecodeError):
+                stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+                try:
+                    CONFIG_FILE.replace(CONFIG_FILE.with_name(f"config.corrupt_{stamp}.json"))
+                except OSError:
+                    pass
                 self.data = json.loads(json.dumps(DEFAULT_CONFIG))
-                self.save()
-            self._migrate()
-            self.save()
+        self._migrate()
+        self.save()
 
     def _migrate(self):
-        settings = self.data.setdefault("settings", {})
-        for k, v in DEFAULT_CONFIG["settings"].items():
-            settings.setdefault(k, v)
-        if "animation_ms" in settings:
-            settings.setdefault("transition_ms", settings.pop("animation_ms"))
-        settings.pop("animation", None)
+        settings = self.data.get("settings")
+        if not isinstance(settings, dict):
+            settings = {}
+            self.data["settings"] = settings
 
-        # The ASCII background experiment was removed outright.
+        if "animation_ms" in settings and "transition_ms" not in settings:
+            settings["transition_ms"] = settings["animation_ms"]
+        settings.pop("animation_ms", None)
+        settings.pop("animation", None)
         settings.pop("bg_ascii", None)
 
-        # rate_limit_safety was a bare float in seconds. Carry it into the
-        # new rl_safety_ms knob so nobody's tuning silently resets.
         if "rate_limit_safety" in settings and "rl_safety_ms" not in settings:
             try:
                 settings["rl_safety_ms"] = int(float(settings["rate_limit_safety"]) * 1000)
@@ -154,15 +175,22 @@ class Config:
                 settings["rl_safety_ms"] = 250
         settings.pop("rate_limit_safety", None)
 
+        for key, value in DEFAULT_CONFIG["settings"].items():
+            settings.setdefault(key, value)
+        self.data["version"] = TOOL_VERSION
+
     def setting(self, key, fallback=None):
         return self.data.get("settings", {}).get(key, fallback)
 
     def set_setting(self, key, value):
-        self.data.setdefault("settings", {})[key] = value
+        self.update_settings({key: value})
+
+    def update_settings(self, values):
+        self.data.setdefault("settings", {}).update(values)
         self.save()
 
     def save(self):
-        CONFIG_FILE.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        _atomic_json(CONFIG_FILE, self.data)
 
 
 # ------------------------------------------------------------
@@ -177,15 +205,21 @@ def load_tokens():
         return []
     try:
         data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
-        return data.get("tokens", [])
-    except Exception:
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        TOKENS_FILE.rename(TOKENS_FILE.with_name(f"tokens.corrupt_{stamp}.json"))
+        tokens = data.get("tokens", [])
+        if not isinstance(tokens, list):
+            raise ValueError("tokens must be a list")
+        return [token for token in tokens if isinstance(token, dict)]
+    except (OSError, ValueError, json.JSONDecodeError):
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        try:
+            TOKENS_FILE.replace(TOKENS_FILE.with_name(f"tokens.corrupt_{stamp}.json"))
+        except OSError:
+            pass
         return []
 
 
 def save_tokens(tokens):
-    TOKENS_FILE.write_text(json.dumps({"tokens": tokens}, indent=2), encoding="utf-8")
+    _atomic_json(TOKENS_FILE, {"tokens": tokens}, private=True)
 
 
 def unique_label(tokens, label):
@@ -217,13 +251,23 @@ def load_whitelist():
         return []
     try:
         data = json.loads(WHITELIST_FILE.read_text(encoding="utf-8"))
-        return data.get("entries", [])
-    except Exception:
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValueError("entries must be a list")
+        return [entry for entry in entries if isinstance(entry, dict)]
+    except (OSError, ValueError, json.JSONDecodeError):
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        try:
+            WHITELIST_FILE.replace(
+                WHITELIST_FILE.with_name(f"whitelist.corrupt_{stamp}.json")
+            )
+        except OSError:
+            pass
         return []
 
 
 def save_whitelist(entries):
-    WHITELIST_FILE.write_text(json.dumps({"entries": entries}, indent=2), encoding="utf-8")
+    _atomic_json(WHITELIST_FILE, {"entries": entries})
 
 
 def whitelist_ids():
@@ -294,16 +338,25 @@ def apply_rate_level(config, level):
     really a starting point rather than a live override -- changing the level
     resets the advanced knobs, and "Reset To Level" in that page restores them.
     """
-    preset = RATE_LIMIT_PRESETS.get(level, RATE_LIMIT_PRESETS["medium"])
-    config.set_setting("rate_limit_level", level)
-    config.set_setting("rl_wait_until", preset["wait_until"])
-    config.set_setting("rl_timeout", preset["timeout"])
-    config.set_setting("rl_spacing_ms", int(preset["spacing"] * 1000))
-    config.set_setting("rl_safety_ms", int(preset["safety"] * 1000))
-    config.set_setting("rl_global_wait", preset["global_wait"])
-    config.set_setting("rl_max_429", preset["max_429"])
-    config.set_setting("rl_max_5xx", preset["max_5xx"])
-    config.set_setting("rl_jitter", preset["jitter"])
+    if level not in RATE_LIMIT_PRESETS:
+        level = "medium"
+    preset = RATE_LIMIT_PRESETS[level]
+    values = {
+        "rate_limit_level": level,
+        "rl_wait_until": preset["wait_until"],
+        "rl_timeout": preset["timeout"],
+        "rl_spacing_ms": int(preset["spacing"] * 1000),
+        "rl_safety_ms": int(preset["safety"] * 1000),
+        "rl_global_wait": preset["global_wait"],
+        "rl_max_429": preset["max_429"],
+        "rl_max_5xx": preset["max_5xx"],
+        "rl_jitter": preset["jitter"],
+    }
+    if hasattr(config, "update_settings"):
+        config.update_settings(values)
+    else:
+        for key, value in values.items():
+            config.set_setting(key, value)
     return preset
 
 
@@ -311,20 +364,31 @@ class RateLimiter:
     """Client-side pacing and backoff for DiscordREST."""
 
     def _configure(self, config):
-        preset = RATE_LIMIT_PRESETS.get(
-            (config.setting("rate_limit_level", "medium") or "medium").lower(),
-            RATE_LIMIT_PRESETS["medium"],
-        )
+        level = str(config.setting("rate_limit_level", "medium") or "medium").lower()
+        preset = RATE_LIMIT_PRESETS.get(level, RATE_LIMIT_PRESETS["medium"])
+
+        def number(key, default, minimum=0):
+            try:
+                return max(minimum, int(config.setting(key, default)))
+            except (TypeError, ValueError, OverflowError):
+                return max(minimum, int(default))
+
+        def flag(key, default):
+            value = config.setting(key, default)
+            if isinstance(value, str):
+                return value.strip().lower() not in ("", "0", "false", "no", "off")
+            return bool(value)
+
         self.level = preset["label"]
-        self.enabled = bool(config.setting("rate_limit", True))
-        self.wait_until = bool(config.setting("rl_wait_until", preset["wait_until"]))
-        self.global_wait = bool(config.setting("rl_global_wait", preset["global_wait"]))
-        self.jitter = bool(config.setting("rl_jitter", preset["jitter"]))
-        self.timeout = max(5, int(config.setting("rl_timeout", preset["timeout"])))
-        self.spacing = max(0.0, int(config.setting("rl_spacing_ms", 150)) / 1000.0)
-        self.safety = max(0.0, int(config.setting("rl_safety_ms", 250)) / 1000.0)
-        self.max_429 = max(0, int(config.setting("rl_max_429", preset["max_429"])))
-        self.max_5xx = max(0, int(config.setting("rl_max_5xx", preset["max_5xx"])))
+        self.enabled = flag("rate_limit", True)
+        self.wait_until = flag("rl_wait_until", preset["wait_until"])
+        self.global_wait = flag("rl_global_wait", preset["global_wait"])
+        self.jitter = flag("rl_jitter", preset["jitter"])
+        self.timeout = number("rl_timeout", preset["timeout"], 5)
+        self.spacing = number("rl_spacing_ms", 150) / 1000.0
+        self.safety = number("rl_safety_ms", 250) / 1000.0
+        self.max_429 = number("rl_max_429", preset["max_429"])
+        self.max_5xx = number("rl_max_5xx", preset["max_5xx"])
 
     # Public alias. ops.py syncs settings through limiter.configure() --
     # without this name every settings change raised AttributeError and
@@ -346,6 +410,7 @@ class RateLimiter:
         self._last = 0.0
         self._bucket_until = 0.0
         self._global_until = 0.0
+        self._lock = threading.RLock()
 
         # session counters, surfaced on the ratelimit settings page
         self.waits = 0
@@ -364,24 +429,26 @@ class RateLimiter:
             seconds += seconds * random.uniform(0.0, 0.15) + random.uniform(0.0, 0.05)
         if seconds > 0:
             time.sleep(seconds)
-            self.slept_for += seconds
+            with self._lock:
+                self.slept_for += seconds
 
     def acquire(self):
         """Block until the next request is allowed. No-op when disabled."""
         if not self.enabled:
             return
-        now = time.monotonic()
-        target = now
-        if self.spacing > 0:
-            target = max(target, self._last + self.spacing)
-        if self.wait_until:
-            target = max(target, self._bucket_until)
-        if self.global_wait:
-            target = max(target, self._global_until)
-        if target > now:
-            self.waits += 1
-            self.sleep_for(target - now)
-        self._last = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            target = now
+            if self.spacing > 0:
+                target = max(target, self._last + self.spacing)
+            if self.wait_until:
+                target = max(target, self._bucket_until)
+            if self.global_wait:
+                target = max(target, self._global_until)
+            if target > now:
+                self.waits += 1
+                self.sleep_for(target - now)
+            self._last = time.monotonic()
 
     def note_response(self, r):
         """Read bucket headers off a non-429 response and schedule the wait."""
@@ -461,6 +528,10 @@ class DiscordREST:
                 "User-Agent": f"NiNogRaker/{TOOL_VERSION} (RATTIKANS)",
             }
         )
+        self.external = requests.Session()
+        self.external.headers.update(
+            {"User-Agent": f"NiNogRaker/{TOOL_VERSION} (RATTIKANS)"}
+        )
         self.logger = logger
         # The limiter owns pacing, header waits and retry backoff. `safety` is
         # only consulted when no config object is supplied (token validation
@@ -470,12 +541,20 @@ class DiscordREST:
     def _throttle(self):
         self.limiter.acquire()
 
-    def request(self, method, path, *, params=None, body=None, _attempt=0):
+    def request(self, method, path, *, params=None, body=None, reason="", _attempt=0):
         lim = self.limiter
         lim.acquire()
+        headers = None
+        if reason:
+            headers = {"X-Audit-Log-Reason": quote(str(reason)[:512], safe="")}
         try:
             r = self.session.request(
-                method, self.BASE + path, params=params, json=body, timeout=lim.timeout
+                method,
+                self.BASE + path,
+                params=params,
+                json=body,
+                headers=headers,
+                timeout=lim.timeout,
             )
         except requests.RequestException as e:
             raise ApiNetworkError(f"connection failed: {e}") from e
@@ -501,15 +580,17 @@ class DiscordREST:
                 )
             lim.sleep_for(wait)
             return self.request(
-                method, path, params=params, body=body, _attempt=_attempt + 1
+                method, path, params=params, body=body, reason=reason,
+                _attempt=_attempt + 1
             )
 
         lim.note_response(r)
 
         if r.status_code >= 500 and _attempt < lim.max_5xx:
-            time.sleep(1.0)
+            lim.sleep_for(min(4.0, 2 ** _attempt))
             return self.request(
-                method, path, params=params, body=body, _attempt=_attempt + 1
+                method, path, params=params, body=body, reason=reason,
+                _attempt=_attempt + 1
             )
         return r
 
@@ -532,9 +613,7 @@ class DiscordREST:
         return self.request("POST", f"/guilds/{guild_id}/channels", body=body)
 
     def delete_channel(self, channel_id, reason=""):
-        return self.request(
-            "DELETE", f"/channels/{channel_id}", body={"reason": reason} if reason else None
-        )
+        return self.request("DELETE", f"/channels/{channel_id}", reason=reason)
 
     def patch_channel(self, channel_id, body):
         return self.request("PATCH", f"/channels/{channel_id}", body=body)
@@ -543,10 +622,9 @@ class DiscordREST:
         return self.request("GET", f"/guilds/{guild_id}/roles")
 
     def create_role(self, guild_id, body, reason=""):
-        payload = dict(body)
-        if reason:
-            payload["reason"] = reason
-        return self.request("POST", f"/guilds/{guild_id}/roles", body=payload)
+        return self.request(
+            "POST", f"/guilds/{guild_id}/roles", body=body, reason=reason
+        )
 
     def delete_role(self, guild_id, role_id):
         return self.request("DELETE", f"/guilds/{guild_id}/roles/{role_id}")
@@ -555,14 +633,7 @@ class DiscordREST:
         return self.request("PATCH", f"/guilds/{guild_id}/roles/{role_id}", body=body)
 
     def patch_role_positions(self, guild_id, positions):
-        # Modify Guild Role Positions is PATCH /guilds/{id}/roles with the
-        # list wrapped as {"positions": [...]}. The previous version hit
-        # PATCH /guilds/{id} with a bare list, which is Modify Guild and
-        # rejects a list body -- every call 400'd silently, so restored
-        # role hierarchies never got their ordering applied.
-        return self.request(
-            "PATCH", f"/guilds/{guild_id}/roles", body={"positions": positions}
-        )
+        return self.request("PATCH", f"/guilds/{guild_id}/roles", body=positions)
 
     def get_members_page(self, guild_id, after="0"):
         return self.request(
@@ -586,7 +657,10 @@ class DiscordREST:
                 on_page(len(members))
             if len(batch) < 1000:
                 return r, members
-            after = batch[-1]["user"]["id"]
+            next_after = str((batch[-1].get("user") or {}).get("id", ""))
+            if not next_after or next_after == after:
+                return r, members
+            after = next_after
 
     def get_member(self, guild_id, user_id):
         return self.request("GET", f"/guilds/{guild_id}/members/{user_id}")
@@ -631,7 +705,10 @@ class DiscordREST:
                 on_page(len(bans))
             if len(batch) < 1000:
                 return r, bans
-            after = batch[-1]["user"]["id"]
+            next_after = str((batch[-1].get("user") or {}).get("id", ""))
+            if not next_after or next_after == after:
+                return r, bans
+            after = next_after
 
     def get_messages(self, channel_id, limit=100):
         return self.request(
@@ -677,7 +754,7 @@ class DiscordREST:
         lim = self.limiter
         lim.acquire()
         try:
-            r = self.session.post(webhook_url, json=body, timeout=lim.timeout)
+            r = self.external.post(webhook_url, json=body, timeout=lim.timeout)
         except requests.RequestException as e:
             raise ApiNetworkError(f"webhook failed: {e}") from e
         if r.status_code == 429:
@@ -693,7 +770,7 @@ class DiscordREST:
         lim = self.limiter
         lim.acquire()
         try:
-            r = self.session.delete(webhook_url, timeout=lim.timeout)
+            r = self.external.delete(webhook_url, timeout=lim.timeout)
         except requests.RequestException as e:
             raise ApiNetworkError(f"webhook delete failed: {e}") from e
         lim.note_response(r)
@@ -724,7 +801,7 @@ class DiscordREST:
         lim = self.limiter
         lim.acquire()
         try:
-            r = self.session.get(url, timeout=timeout or lim.timeout)
+            r = self.external.get(url, timeout=timeout or lim.timeout)
         except requests.RequestException as e:
             raise ApiNetworkError(f"download failed: {e}") from e
         lim.note_response(r)
@@ -749,13 +826,11 @@ def dm_send(rest, user_id, content):
 # answering 404/403 for the bot itself, the bot has been kicked or banned,
 # so the context flag flips and the UI sounds off on its next render.
 
-import threading
-
-
 class GuildWatchdog:
-    def __init__(self, rest, guild_id, interval=15, on_lost=None):
+    def __init__(self, rest, guild_id, user_id, interval=15, on_lost=None):
         self.rest = rest
         self.guild_id = guild_id
+        self.user_id = user_id
         self.interval = max(5, int(interval or 15))
         self.on_lost = on_lost
         self._stop = threading.Event()
@@ -777,7 +852,7 @@ class GuildWatchdog:
     def check_once(self):
         """One probe. Returns 'ok', 'lost', or 'unknown' (network error)."""
         try:
-            r = self.rest.get_member(self.guild_id, "@me")
+            r = self.rest.get_member(self.guild_id, self.user_id)
         except ApiNetworkError:
             self.last_status = "unknown"
             return "unknown"
@@ -865,10 +940,10 @@ def copy_to_clipboard(text):
 # SECTION 11 | OPTIONAL GATEWAY PRESENCE (best effort)
 # ------------------------------------------------------------
 # REST alone cannot say who is online; presence lives on the gateway behind
-# the GUILD_PRESENCES intent. If the `websockets` package is available and
-# the bot has the intent, we do a one-shot connect, listen briefly for
-# GUILD_MEMBER_LIST_UPDATE chunks, and report the online set. Any failure
-# returns None and the member picker notes presence is unavailable.
+# the GUILD_PRESENCES intent. A short-lived official bot gateway connection
+# reads initial GUILD_CREATE presence data and subsequent PRESENCE_UPDATE
+# events. Any failure returns None and the member picker notes that presence
+# is unavailable.
 
 def fetch_online_ids(token, guild_id, timeout=8.0):
     result = {"ids": None}
@@ -882,6 +957,8 @@ def fetch_online_ids(token, guild_id, timeout=8.0):
 
         async def _run():
             online = set()
+            sequence = {"value": None}
+            target_seen = False
             async with websockets.connect(
                     "wss://gateway.discord.gg/?v=10&encoding=json",
                     max_size=8 * 1024 * 1024) as ws:
@@ -889,51 +966,52 @@ def fetch_online_ids(token, guild_id, timeout=8.0):
                 interval = (hello.get("d") or {}).get("heartbeat_interval", 40000) / 1000.0
 
                 async def _heart():
-                    # The gateway drops any client that misses a heartbeat.
                     try:
                         while True:
                             await asyncio.sleep(interval)
-                            await ws.send(json.dumps({"op": 1, "d": None}))
+                            await ws.send(json.dumps({"op": 1, "d": sequence["value"]}))
                     except Exception:
                         return
 
-                asyncio.ensure_future(_heart())
+                heart = asyncio.create_task(_heart())
                 await ws.send(json.dumps({
                     "op": 2,
                     "d": {
                         "token": token,
-                        "intents": (1 << 0) | (1 << 8),  # GUILDS | GUILD_PRESENCES
+                        "intents": (1 << 0) | (1 << 8),
                         "properties": {"os": "linux", "browser": "ninog", "device": "ninog"},
                     },
                 }))
-                await ws.send(json.dumps({
-                    "op": 14,
-                    "d": {"guild_id": str(guild_id), "query": "", "limit": 0,
-                          "presences": True},
-                }))
-                import asyncio as _a
-                end = _a.get_event_loop().time() + timeout
-                while _a.get_event_loop().time() < end:
-                    try:
-                        raw = await _a.wait_for(ws.recv(), timeout=1.5)
-                    except Exception:
-                        continue
-                    try:
+                end = asyncio.get_running_loop().time() + timeout
+                try:
+                    while asyncio.get_running_loop().time() < end:
+                        remaining = end - asyncio.get_running_loop().time()
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=min(1.5, remaining))
+                        except asyncio.TimeoutError:
+                            if target_seen:
+                                break
+                            continue
                         ev = json.loads(raw)
-                    except Exception:
-                        continue
-                    t, d = ev.get("t"), ev.get("d") or {}
-                    if t in ("GUILD_MEMBER_LIST_UPDATE", "READY"):
-                        for op in d.get("ops", []):
-                            for item in op.get("items", []):
-                                member = item.get("member") or {}
-                                pres = member.get("presence") or {}
-                                uid = (member.get("user") or {}).get("id")
-                                if uid and pres.get("status") in ("online", "idle", "dnd"):
+                        if ev.get("s") is not None:
+                            sequence["value"] = ev["s"]
+                        event, data = ev.get("t"), ev.get("d") or {}
+                        if event == "GUILD_CREATE" and str(data.get("id")) == str(guild_id):
+                            target_seen = True
+                            for presence in data.get("presences", []):
+                                uid = (presence.get("user") or {}).get("id")
+                                if uid and presence.get("status") in ("online", "idle", "dnd"):
                                     online.add(uid)
-                        if t == "GUILD_MEMBER_LIST_UPDATE":
-                            break
-            result["ids"] = online
+                        elif event == "PRESENCE_UPDATE" and str(data.get("guild_id")) == str(guild_id):
+                            uid = (data.get("user") or {}).get("id")
+                            if uid:
+                                if data.get("status") in ("online", "idle", "dnd"):
+                                    online.add(uid)
+                                else:
+                                    online.discard(uid)
+                finally:
+                    heart.cancel()
+            result["ids"] = online if target_seen else None
 
         try:
             asyncio.run(_run())
@@ -1040,21 +1118,23 @@ def _redact_config_bytes(path, raw):
         text = raw.decode("utf-8", "replace")
     except Exception:
         return b"(binary file omitted)"
-    if path.name == "tokens.json":
+    if path.name.startswith("tokens"):
         try:
             data = json.loads(text)
-            for t in data.get("tokens", []):
-                val = str(t.get("data", ""))
-                t["data"] = (val[:6] + "..." + val[-4:]) if len(val) > 12 else "(redacted)"
+            for token in data.get("tokens", []):
+                value = str(token.get("data", ""))
+                token["data"] = (
+                    value[:6] + "..." + value[-4:] if len(value) > 12 else "(redacted)"
+                )
             return json.dumps(data, indent=2).encode("utf-8")
         except Exception:
-            pass  # corrupt JSON: fall through to regex masking
+            return b"(corrupt token vault omitted)"
     return mask_secret_text(text).encode("utf-8", "replace")
 
 
 def build_crash_report(exc_type, exc, tb, ctx=None, origin="uncaught"):
     """Write the full diagnostic bundle. Returns the report directory."""
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     report = REPORTLOG_DIR / "crashes" / f"crash_{stamp}"
     src_dir = report / "source"
     cfg_dir = report / "config_snapshot"

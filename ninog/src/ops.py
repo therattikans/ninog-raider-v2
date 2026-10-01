@@ -222,7 +222,8 @@ def token_browser(ctx):
             console.print()
 
         present_frame(ctx, render)
-        hints = [f"[white]1-{len(page)}[/white] select"]
+        first_no, last_no = offset + 1, offset + len(page)
+        hints = [f"[white]{first_no}-{last_no}[/white] select"]
         if len(pages) > 1:
             hints.append("[white]N[/white] next  [white]P[/white] prev")
         hints.append("[white]A[/white] add  [white]D[/white] delete  [white]Q[/white] quit")
@@ -230,9 +231,9 @@ def token_browser(ctx):
 
         if choice.isdigit():
             n = int(choice)
-            if 1 <= n <= len(page):
-                return tokens[offset + n - 1]
-            notice("OUT OF RANGE", [f"expected 1-{len(page)} on this page."], "warn")
+            if first_no <= n <= last_no:
+                return tokens[n - 1]
+            notice("OUT OF RANGE", [f"expected {first_no}-{last_no} on this page."], "warn")
             press_enter()
         elif choice == "n" and len(pages) > 1:
             page_idx = (page_idx + 1) % len(pages)
@@ -411,7 +412,9 @@ def attach_guild(ctx, guild):
             pass
 
     interval = int(ctx.config.setting("ban_watch_secs", 15) or 15)
-    ctx.watchdog = GuildWatchdog(ctx.rest, guild["id"], interval=interval, on_lost=_lost)
+    ctx.watchdog = GuildWatchdog(
+        ctx.rest, guild["id"], ctx.me["id"], interval=interval, on_lost=_lost
+    )
     ctx.watchdog.start()
     ctx.logger.log("WATCHDOG", f"watching {guild.get('name')} every {interval}s")
 
@@ -589,7 +592,7 @@ def take_snapshot(ctx, reason="manual"):
     }
 
     server_dir = SNAPSHOTS_DIR / sanitize_name(gname)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     run_dir = server_dir / f"snap_{stamp}"
     internals = run_dir / "internals"
     for sub in ("Roles", "Members", "Server Settings", "Channels",
@@ -962,7 +965,7 @@ def restore_messages(ctx, blob, channel_map):
             if wh.status_code not in (200, 201):
                 skipped += len(msgs)
                 continue
-            url = wh.json().get("url")
+            url = webhook_url_of(wh.json())
             if not url:
                 skipped += len(msgs)
                 continue
@@ -1006,7 +1009,7 @@ def maybe_restore_bans(ctx, blob):
         for b in bans:
             if b.get("id"):
                 r = rest.ban_member(gid, b["id"])
-                if r.status_code in (200, 204, 403):
+                if r.status_code in (200, 204):
                     applied += 1
     ctx.logger.log("OP_RESULT", f"restore_bans | applied={applied}/{len(bans)}")
     console.print(f"[dim]bans |[/dim] [white]{applied}[/white] [dim]re-applied[/dim]")
@@ -1403,13 +1406,29 @@ def _fetch_members_capped(ctx, cap=SERVER_PICK_CAP):
     """Members via the paginator, capped. Returns (members, over_cap, err)."""
     rest, gid = ctx.rest, ctx.guild["id"]
     approx = ctx.guild.get("approximate_member_count") or 0
-    r, members = rest.get_all_members(gid)
-    if r.status_code == 403:
-        return [], approx > cap, "403 | member listing needs the SERVER MEMBERS intent"
-    if r.status_code != 200 and not members:
-        return [], approx > cap, f"status {r.status_code}"
-    over_cap = (approx and approx > cap) or len(members) > cap
-    return members[:cap], bool(over_cap), None
+    members = []
+    after = "0"
+    while len(members) <= cap:
+        r = rest.get_members_page(gid, after)
+        if r.status_code == 403:
+            return [], bool(approx and approx > cap), \
+                "403 | member listing needs the SERVER MEMBERS intent"
+        if r.status_code != 200:
+            if not members:
+                return [], bool(approx and approx > cap), f"status {r.status_code}"
+            break
+        batch = r.json()
+        if not isinstance(batch, list) or not batch:
+            break
+        members.extend(batch)
+        if len(batch) < 1000:
+            break
+        next_after = str((batch[-1].get("user") or {}).get("id", ""))
+        if not next_after or next_after == after:
+            break
+        after = next_after
+    over_cap = bool((approx and approx > cap) or len(members) > cap)
+    return members[:cap], over_cap, None
 
 
 def _presence_order(ctx, members):
@@ -1535,7 +1554,8 @@ def _pick_from_server(ctx, multi):
         if not confirm("continue with the first 2000?", True):
             return None
     with console.status("[orange]fetching member list...[/orange]"):
-        members, _trunc, err = _fetch_members_capped(ctx)
+        members, truncated, err = _fetch_members_capped(ctx)
+    over_cap = over_cap or truncated
     if err:
         notice("CANNOT LIST", [err], "bad")
         return None
@@ -2112,14 +2132,14 @@ def op_purge_messages(ctx):
         return
 
     cutoff = datetime.now(timezone.utc).timestamp() - (14 * 86400)
-    bulked = singled = failed = 0
+    bulked = singled = failed_messages = failed_channels = 0
 
     with console.status(f"[orange]purging {len(channels)} channels...[/orange]") as status:
         for i, c in enumerate(channels):
             status.update(f"[orange]channel {i + 1}/{len(channels)} | {c.get('name')}[/orange]")
             mr = rest.get_messages(c["id"], limit=100)
             if mr.status_code != 200:
-                failed += 1
+                failed_channels += 1
                 continue
             recent, old = [], []
             for m in mr.json():
@@ -2137,20 +2157,32 @@ def op_purge_messages(ctx):
                     br = rest.bulk_delete(c["id"], batch)
                     if br.status_code in (200, 204):
                         bulked += len(batch)
+                    else:
+                        failed_messages += len(batch)
                 else:
                     for mid in batch:
                         dr = rest.delete_message(c["id"], mid)
                         if dr.status_code in (200, 204):
                             singled += 1
+                        else:
+                            failed_messages += 1
             for mid in old:
                 dr = rest.delete_message(c["id"], mid)
                 if dr.status_code in (200, 204):
                     singled += 1
+                else:
+                    failed_messages += 1
 
-    ctx.logger.log("OP_RESULT", f"purge | bulk={bulked} single={singled} chfailed={failed}")
+    ctx.logger.log(
+        "OP_RESULT",
+        f"purge | bulk={bulked} single={singled} "
+        f"msgfailed={failed_messages} chfailed={failed_channels}",
+    )
     console.print(
         f"[dim]done |[/dim] [white]{bulked}[/white] [dim]bulk-deleted |[/dim] "
-        f"[white]{singled}[/white] [dim]single-deleted |[/dim] [white]{failed}[/white] [dim]channels failed[/dim]"
+        f"[white]{singled}[/white] [dim]single-deleted |[/dim] "
+        f"[white]{failed_messages}[/white] [dim]messages failed |[/dim] "
+        f"[white]{failed_channels}[/white] [dim]channels unreadable[/dim]"
     )
 
 
@@ -2313,8 +2345,9 @@ def op_webhook_spam(ctx):
     with console.status(f"[orange]spamming {total} messages...[/orange]") as status:
         n = 0
         for wh in webhooks:
-            url = wh.get("url")
+            url = webhook_url_of(wh)
             if not url:
+                failed += per_hook
                 continue
             for j in range(per_hook):
                 n += 1
@@ -2407,12 +2440,15 @@ def _export_webhooks_to_file(ctx, urls):
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = EXPORTS_DIR / f"webhooks_{sanitize_name(gname)}_{stamp}.txt"
     path.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
     ctx.logger.log("OP_RESULT", f"extract_webhooks | file {path} ({len(urls)} urls)")
     return path
 
 
 def op_extract_webhooks(ctx):
-    ensure_pre_op_snapshot(ctx, "EXTRACT WEBHOOKS")
     with console.status("[orange]sweeping guild for webhooks...[/orange]"):
         urls = collect_all_webhooks(ctx)
     if not urls:
@@ -2532,10 +2568,6 @@ def op_member_lookup(ctx):
                [f"status {r.status_code} | wrong id, not in server, or missing intent."], "bad")
         return
     m = r.json()
-    if target.get("member") and target["member"].get("_fetched") is None:
-        # reuse already-fetched member payloads when the picker has them,
-        # but only the fields that the fresh API also provides
-        pass
     roles_r = rest.get_roles(gid)
     role_names = {}
     if roles_r.status_code == 200:
@@ -4045,16 +4077,16 @@ def render_page(ctx, page, page_idx):
 
     nxt = PAGES[(page_idx + 1) % len(PAGES)]
     prv = PAGES[(page_idx - 1) % len(PAGES)]
-    foot = Table.grid(padding=(0, 2))
+    foot = Table.grid(padding=(0, 3))
     foot.add_row(
-        f"[white][>>][/white] Page {(page_idx + 1) % len(PAGES) + 1} | {nxt['name']}",
-        f"[white][<<][/white] Page {(page_idx - 1) % len(PAGES) + 1} | {prv['name']}",
+        f"[brand]N[/brand] next · {nxt['name']}",
+        f"[brand]P[/brand] previous · {prv['name']}",
     )
     foot.add_row(
-        "[white][~][/white] Settings",
-        "[white][00][/white] Exit",
+        "[brand]S[/brand] settings",
+        "[brand]Q[/brand] exit",
     )
-    console.print(Panel(foot, border_style="deep", box=box.ROUNDED, padding=(0, 2)))
+    console.print(Panel(foot, border_style="deep", box=box.ROUNDED, padding=(0, 1)))
     console.print()
 
 
@@ -4077,7 +4109,7 @@ def page_loop(ctx):
 
         if choice in ("00", "q", "exit", "x"):
             return "quit"
-        if choice in ("~", "e"):
+        if choice in ("~", "s", "e"):
             result = settings_screen(ctx)
             if result == "quit":
                 return "quit"
@@ -4086,10 +4118,10 @@ def page_loop(ctx):
             if isinstance(result, tuple) and result[0] == "page":
                 page_idx = result[1]
             continue
-        if choice == ">>":
+        if choice in (">>", "n"):
             page_idx = (page_idx + 1) % len(PAGES)
             continue
-        if choice == "<<":
+        if choice in ("<<", "p"):
             page_idx = (page_idx - 1) % len(PAGES)
             continue
         if choice.isdigit():
@@ -4110,5 +4142,5 @@ def page_loop(ctx):
                 press_enter()
                 continue
         notice("OUT OF RANGE",
-               [f"expected 1-{len(page['ops'])} | ~ settings | >> | << | 00."], "warn")
+               [f"expected 1-{len(page['ops'])} | N next | P previous | S settings | Q exit."], "warn")
         press_enter()

@@ -8,6 +8,7 @@ from .core import (
     PERMISSION_BITS,
     WORKFLOWS_DIR,
     ApiNetworkError,
+    build_crash_report,
 )
 from .ui import (
     DONE,
@@ -787,14 +788,19 @@ def execute_workflow(ctx, index, wf):
     except KeyboardInterrupt:
         aborted = True
     except Exception as e:
-        # A workflow runs a user-authored chain against a live API, so a bug in
-        # the engine must not take the whole session down mid-run. Contain it,
-        # log it, and tell the user which run died.
         aborted = True
         ctx.logger.log("WF_CRASH", f"{type(e).__name__}: {e}")
+        try:
+            report = build_crash_report(
+                type(e), e, e.__traceback__, ctx=ctx,
+                origin=f"workflow {wf.get('name', '?')}",
+            )
+            detail = f"crash report: [white]{report}[/white]"
+        except Exception:
+            detail = "the report log has the detail."
         notice("WORKFLOW ERROR",
                [f"[white]{type(e).__name__}[/white]: {str(e)[:200]}",
-                "the run stopped. the report log has the detail."], "bad")
+                "the run stopped.", detail], "bad")
     finally:
         board.stop()
 
@@ -857,10 +863,14 @@ def collect_due_workflows(ctx):
                 due.append((wf, "bot kicked/banned"))
                 break
             if kind == "interval":
-                last = state.get(f"interval::{name}", 0.0)
+                state_key = f"interval::{name}"
                 every = max(30, int(t.get("seconds", 300)))
+                last = state.get(state_key)
+                if last is None:
+                    state[state_key] = now
+                    continue
                 if now - last >= every:
-                    state[f"interval::{name}"] = now
+                    state[state_key] = now
                     due.append((wf, f"interval {every}s"))
                     break
     ctx.just_selected_guild = False
