@@ -1,31 +1,4 @@
-# ==============================================================
-#   NiNog Raker v2.0 | THE RATTIKANS
-#   src/workflow.py | workflow engine — chained ops, pre-set inputs
-# ==============================================================
-#
-#   A workflow is dead simple by design:
-#
-#     name      what it is called
-#     trigger   ONE of: manual / on server select / on ban detected /
-#               every N seconds
-#     steps     an ordered, unlimited chain of ops. Each op carries the
-#               answers it will need, recorded ONCE at build time, so a
-#               run never pauses to ask for them mid-fire.
-#
-#   That is the whole model. No condition editor, no loop builder, no
-#   branch tree in the UI — the engine still EXECUTES legacy files
-#   with those kinds (wait/condition/loop/note/confirm), but the
-#   builder only produces clean op chains with pre-set inputs.
-#
-#   Editing a workflow means exactly two things: re-record a step's
-#   answers, or delete the workflow. Nothing else exists to break.
-#
-#   This module imports src.core and src.ui only. It never imports
-#   src.ops -- ops.py imports this module and hands the op registry
-#   in as a parameter, which keeps the one dangerous edge from
-#   being circular.
-# ==============================================================
-
+#simplified
 import json
 import re
 import time
