@@ -674,7 +674,6 @@ def _rerecord_inputs(ctx, index, flows):
     if step.get("kind") != "op":
         notice("NOT AN OP", ["only op steps carry inputs."], "warn")
         return False
-    name = (index.get(step.get("op", "")) or {}).get("name", step.get("op", "?"))
     old = step.get("answers") or []
     old_labels = step.get("labels") or []
     if old:
