@@ -320,7 +320,7 @@ next to `main.py` and are git-ignored.
 - **Extract Webhooks**: pulls every webhook URL out of the guild (guild-wide
   endpoint + per-channel sweep) and delivers them to you so you can fuck someone up without them noticing. read only.
 - **Ban detection**: Watchdog just watches for the bot exiting the server, lets you know so you don't slap a nonexistent cake.
-- **Workflow engine** pretty simple: chain ops, pre set the actions, and it fires hands-free. 
+- **Workflow engine**: build a chain by walking through each operation's normal prompts. Setup uses live read-only server data, simulates every write, and shows the saved choices before the workflow is stored. Runs replay those choices hands-free and stop with a clear reconfigure notice if an operation's prompts have changed. Operations whose numeric resource picks can go stale are intentionally kept out of workflows. Manual, server-selection, ban-detection, and interval triggers are available.
 - **Tool Management page**: Diagnoser (source hashes + compile check, config
   JSON/unicode validation, workflow file validation, all the good stuff)
   Report Explorer included.
@@ -329,6 +329,15 @@ next to `main.py` and are git-ignored.
   session, writes a full bundle to `reportlog/crashes/`. You can simply send it over to us, and we'll supply a fix.
 - Snapshots before every destructive op, restore for roles/channels/settings/
   messages/bans, etcetera.
+
+### Workflow quick start
+
+1. Open **Workflows → Workflow Engine**, press `N`, name the workflow, and pick its trigger.
+2. Pick an operation. The tool opens its real prompts against the currently selected server, but all writes are simulated during setup.
+3. Finish and confirm that operation just as you want it to run. Repeat to add more operations, then choose `B` from the operation picker to save the chain.
+4. Select the workflow number to run it. Use `E` to walk through and replace a step's saved setup later.
+
+A run never falls back to surprise live questions. If saved input is missing, left over, or no longer matches the prompt it was recorded for, that step is marked stale and the workflow tells you to reconfigure it.
 
 ## Layout
 

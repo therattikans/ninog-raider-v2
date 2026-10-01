@@ -692,37 +692,76 @@ def notice(title, lines, style="orange"):
 # When a workflow step runs, the engine feeds the op the answers that were
 # recorded at build time through this hook. Empty feed = normal live prompts.
 _INPUT_FEED = None
+_INPUT_FEED_STRICT = False
+_INPUT_CAPTURE = None
 
 
-def set_input_feed(feed):
-    """Install/clear a deque of pre-recorded prompt answers.
+class InputReplayError(RuntimeError):
+    pass
 
-    Any non-None value marks 'a workflow step is running': press_enter()
-    pauses are skipped entirely so a fire is never held up by an op's
-    trailing 'press enter'. Real prompts fall through to live input once
-    the recording runs dry.
-    """
-    global _INPUT_FEED
+
+def set_input_feed(feed, strict=False):
+    global _INPUT_FEED, _INPUT_FEED_STRICT
     _INPUT_FEED = feed
+    _INPUT_FEED_STRICT = bool(strict)
 
 
-def _fed():
-    """Next recorded answer, or None when the feed is empty/absent."""
+def begin_input_capture():
+    global _INPUT_CAPTURE
+    _INPUT_CAPTURE = []
+    return _INPUT_CAPTURE
+
+
+def end_input_capture():
+    global _INPUT_CAPTURE
+    captured = _INPUT_CAPTURE or []
+    _INPUT_CAPTURE = None
+    return captured
+
+
+def _record_input(kind, prompt, value):
+    if _INPUT_CAPTURE is not None:
+        _INPUT_CAPTURE.append({
+            "kind": kind,
+            "prompt": _plain(prompt),
+            "value": str(value),
+        })
+
+
+def _fed(kind, prompt):
     if _INPUT_FEED is None:
         return None
     try:
-        v = _INPUT_FEED.popleft()
-        console.print(f"[dim]> replay: {v}[/dim]")
-        return v
+        item = _INPUT_FEED.popleft()
     except IndexError:
+        if _INPUT_FEED_STRICT:
+            raise InputReplayError(f"saved inputs ended before: {_plain(prompt)}")
         return None
+    if isinstance(item, dict):
+        saved_kind = item.get("kind", "ask")
+        if saved_kind != kind:
+            raise InputReplayError(
+                f"saved input type {saved_kind!r} no longer matches {kind!r}: {_plain(prompt)}"
+            )
+        saved_prompt = str(item.get("prompt", ""))
+        current_prompt = _plain(prompt)
+        if _INPUT_FEED_STRICT and saved_prompt and saved_prompt != current_prompt:
+            raise InputReplayError(
+                f"saved prompt {saved_prompt!r} no longer matches {current_prompt!r}"
+            )
+        value = str(item.get("value", ""))
+    else:
+        value = str(item)
+    console.print(f"[dim]> saved: {value or '(default)'}[/dim]")
+    return value
+
 
 def ask(text, default=None):
     show_default = default not in (None, "")
     prompt = f"[orange]{text}[/orange]"
     if show_default:
         prompt += f" [dim]({default})[/dim]"
-    fed = _fed()
+    fed = _fed("ask", text)
     if fed is not None:
         console.print(prompt + f" [white]›[/white] [white]{fed}[/white]")
         return fed if fed else ("" if default is None else default)
@@ -730,7 +769,8 @@ def ask(text, default=None):
     try:
         raw = input().strip()
     except EOFError:
-        return "" if default is None else default
+        raw = ""
+    _record_input("ask", text, raw)
     if not raw:
         return "" if default is None else default
     return raw
@@ -768,7 +808,7 @@ def confirm(text, default=False):
     else:
         d = "[dim]y[/dim]/[white]n[/white]"
     while True:
-        fed = _fed()
+        fed = _fed("confirm", text)
         if fed is not None:
             raw = fed.strip().lower()
             console.print(f"[orange]{text}[/orange] [dim]([/dim]{d}[dim])[/dim] [white]{raw}[/white]")
@@ -777,8 +817,8 @@ def confirm(text, default=False):
             try:
                 raw = input().strip().lower()
             except EOFError:
-                console.print()
-                return default
+                raw = ""
+            _record_input("confirm", text, raw)
         if not raw:
             console.print()
             return default
@@ -793,8 +833,8 @@ def confirm(text, default=False):
 
 
 def press_enter():
-    if _INPUT_FEED is not None:
-        return  # a workflow step is running; never pause the fire
+    if _INPUT_FEED is not None or _INPUT_CAPTURE is not None:
+        return
     console.print("[orange]›[/orange] [dim]press enter[/dim]", end=" ")
     try:
         input()

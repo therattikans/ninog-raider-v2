@@ -1,4 +1,4 @@
-#simplified
+import copy
 import json
 import re
 import time
@@ -16,11 +16,14 @@ from .ui import (
     PENDING,
     RUNNING,
     SKIPPED,
+    InputReplayError,
     TodoBoard,
     ask,
     ask_int,
+    begin_input_capture,
     confirm,
     console,
+    end_input_capture,
     notice,
     press_enter,
     sanitize_name,
@@ -57,7 +60,7 @@ OP_PERMISSIONS = {
     "restore_full": ["MANAGE_ROLES", "MANAGE_CHANNELS", "MANAGE_GUILD"],
     "restore_channels": ["MANAGE_CHANNELS"],
     "restore_roles": ["MANAGE_ROLES"],
-    "restore_settings": ["MANAGE_GUILD"],
+    "restore_settings": ["MANAGE_GUILD", "MANAGE_ROLES"],
     "send_message": ["SEND_MESSAGES"],
     "purge_messages": ["MANAGE_MESSAGES"],
     "create_webhooks": ["MANAGE_WEBHOOKS"],
@@ -115,7 +118,7 @@ def build_index(pages):
     for page in pages:
         for entry in page.get("ops", []):
             slug = slugify(entry["name"])
-            if slug in EXCLUDED_SLUGS:
+            if slug in EXCLUDED_SLUGS or not entry.get("workflow", True):
                 continue
             # Two ops cannot share a slug; the second one gets a suffix so the
             # reference stays resolvable instead of silently pointing at the
@@ -162,7 +165,7 @@ def describe_step(step, index=None):
         entry = (index or {}).get(slug)
         name = entry["name"] if entry else slug
         n = len(step.get("answers") or [])
-        return name if not n else f"{name} [{n} pre-set]"
+        return name if not n else f"{name} [{n} saved inputs]"
     if k == "wait":
         if step.get("until"):
             c = step["until"]
@@ -360,33 +363,147 @@ def delete_workflow_file(name):
 
 
 # ------------------------------------------------------------
-# ANSWER RECORDER — pre-set the op's inputs for when it fires
+# GUIDED STEP SETUP
 # ------------------------------------------------------------
 
-def _record_answers(ctx, op_name):
-    """Capture the exact answers an op will need, in prompt order."""
-    console.print()
-    screen_title(f"PRE-SET INPUTS | {op_name}", "what the op will ask, answered once, now")
-    console.print("  [dim]Type each answer exactly as you would answer the op live,[/dim]")
-    console.print("  [dim]in order, one per line. The op reuses them when it fires.[/dim]")
-    console.print("  [dim]Blank line = take the op's default for that question.[/dim]")
-    console.print("  [dim]Type END on its own line to finish recording.[/dim]")
-    answers = []
-    while len(answers) < MAX_RECORDED_ANSWERS:
-        raw = ask(f"answer #{len(answers) + 1} (END finishes)")
-        if raw is None or str(raw).strip().upper() == "END":
-            break
-        answers.append(raw)
-    if answers:
-        notice("RECORDED",
-               [f"[white]{len(answers)}[/white] answer(s) locked in for [white]{op_name}[/white].",
-                "the op fires hands-free. if the live server state forces",
-                "an extra question, it gets asked at run time."], "good")
-    else:
-        notice("NOTHING RECORDED",
-               [f"[white]{op_name}[/white] will ask its questions live when it fires."], "warn")
-    return answers
 
+class _PlanResponse:
+    def __init__(self, status_code=200, data=None):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+        self.text = "planned response"
+        self.content = b""
+        self.headers = {}
+
+    def json(self):
+        return self._data
+
+
+class _PlanLogger:
+    def log(self, *_args, **_kwargs):
+        return None
+
+
+class _PlanConfig:
+    def __init__(self, real):
+        self.real = real
+        self.data = copy.deepcopy(getattr(real, "data", {}))
+
+    def setting(self, key, fallback=None):
+        if key == "auto_snapshot":
+            return False
+        return self.real.setting(key, fallback)
+
+    def set_setting(self, key, value):
+        self.data.setdefault("settings", {})[key] = value
+
+    def update_settings(self, values):
+        self.data.setdefault("settings", {}).update(values)
+
+
+class _PlanningREST:
+    READS = {
+        "get_me", "get_guilds", "get_guild", "get_channels", "get_roles",
+        "get_members_page", "get_all_members", "get_member", "get_bans_page",
+        "get_all_bans", "get_messages", "get_guild_webhooks",
+        "get_channel_webhooks", "get_gateway", "get_dm_channels",
+        "get_onboarding", "download",
+    }
+
+    def __init__(self, real):
+        self.real = real
+        self.writes = []
+        self.session = real.session
+        self.limiter = real.limiter
+        self._counter = 0
+
+    def __getattr__(self, name):
+        target = getattr(self.real, name)
+        if name in self.READS:
+            return target
+        if not callable(target):
+            return target
+
+        def planned(*args, **kwargs):
+            self._counter += 1
+            self.writes.append((name, args, kwargs))
+            sid = f"planned-{self._counter}"
+            if name == "create_role":
+                return _PlanResponse(200, {"id": sid, "name": "planned role"})
+            if name == "create_channel":
+                return _PlanResponse(201, {"id": sid, "name": "planned-channel"})
+            if name == "create_webhook":
+                return _PlanResponse(200, {"id": sid, "token": "planned-token"})
+            if name == "create_invite":
+                return _PlanResponse(200, {"code": "planned-invite"})
+            if name == "create_dm":
+                return _PlanResponse(200, {"id": sid})
+            if name == "bulk_ban":
+                user_ids = list(args[1]) if len(args) > 1 else []
+                return _PlanResponse(200, {"banned_users": user_ids, "failed_users": []})
+            if name in {"patch_guild", "patch_channel", "patch_role",
+                        "modify_member", "put_onboarding", "send_message"}:
+                return _PlanResponse(200, {"id": sid})
+            return _PlanResponse(204)
+
+        return planned
+
+
+def _planning_context(ctx):
+    planned = copy.copy(ctx)
+    planned.config = _PlanConfig(ctx.config)
+    planned.logger = _PlanLogger()
+    planned.rest = _PlanningREST(ctx.rest)
+    planned.watchdog = None
+    return planned
+
+
+def _record_answers(ctx, entry):
+    op_name = entry["name"]
+    console.print()
+    screen_title(f"SET UP | {op_name}", "walk through the real prompts; no changes are sent")
+    console.print("  [dim]Read-only Discord data is live, so pickers show current resources.[/dim]")
+    console.print("  [dim]Every API write is simulated. The saved step replays these choices.[/dim]")
+    console.print("  [dim]Cancel or decline the action to abandon this step.[/dim]")
+    console.print()
+    if not confirm("start guided setup?", True):
+        return None
+
+    planned = _planning_context(ctx)
+    begin_input_capture()
+    error = None
+    try:
+        entry["fn"](planned)
+    except (KeyboardInterrupt, EOFError):
+        error = "setup interrupted"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        answers = end_input_capture()
+
+    if error:
+        notice("SETUP FAILED", [error], "bad")
+        return None
+    if len(answers) > MAX_RECORDED_ANSWERS:
+        notice("TOO MANY INPUTS", [f"step exceeded the {MAX_RECORDED_ANSWERS}-input limit."], "bad")
+        return None
+    if not planned.rest.writes:
+        notice("SETUP CANCELLED", ["the walkthrough did not reach a planned action."], "warn")
+        return None
+
+    preview = []
+    for item in answers[:8]:
+        value = item["value"] or "(default)"
+        preview.append(f"[dim]{item['prompt']}[/dim] → [white]{value}[/white]")
+    if len(answers) > 8:
+        preview.append(f"[dim]...and {len(answers) - 8} more inputs[/dim]")
+    notice(
+        "STEP READY",
+        [f"[white]{op_name}[/white] · {len(answers)} saved inputs · "
+         f"{len(planned.rest.writes)} planned API writes", "", *preview],
+        "good",
+    )
+    return answers
 
 def _pick_trigger():
     """One trigger, picked at creation. No separate editor exists."""
@@ -430,7 +547,7 @@ def _pick_op(ctx, index):
 
 
 def create_workflow(ctx, index):
-    """name -> trigger -> chain ops with pre-set inputs -> save. Done."""
+    """Build a workflow through guided, non-mutating operation walkthroughs."""
     screen_title("NEW WORKFLOW", "simple on purpose")
     name = ask("workflow name")
     if not (name or "").strip():
@@ -453,7 +570,9 @@ def create_workflow(ctx, index):
         slug, entry = picked
         # The contract: options are chosen NOW, for when it fires — never
         # invented mid-run.
-        answers = _record_answers(ctx, entry["name"])
+        answers = _record_answers(ctx, entry)
+        if answers is None:
+            continue
         steps.append({"kind": "op", "op": slug, "answers": answers})
 
     if not steps:
@@ -471,7 +590,7 @@ def create_workflow(ctx, index):
 
 
 # ------------------------------------------------------------
-# THE ONLY EDITS THAT EXIST: re-record one step's inputs, or delete
+# STEP SETUP AND DELETION
 # ------------------------------------------------------------
 
 def _rerecord_inputs(ctx, index, flows):
@@ -500,13 +619,19 @@ def _rerecord_inputs(ctx, index, flows):
     if step.get("kind") != "op":
         notice("NOT AN OP", ["only op steps carry inputs."], "warn")
         return False
-    name = (index.get(step.get("op", "")) or {}).get("name", step.get("op", "?"))
-    step["answers"] = _record_answers(ctx, name)
+    entry = index.get(step.get("op", ""))
+    if entry is None:
+        notice("MISSING OP", ["this step no longer maps to an available operation."], "bad")
+        return False
+    answers = _record_answers(ctx, entry)
+    if answers is None:
+        return False
+    step["answers"] = answers
     save_workflow(flow)
     ctx.logger.log("WORKFLOW_EDITED", f"{flow.get('name')} | step {si + 1} re-recorded")
     notice("UPDATED",
            [f"step {si + 1} of [white]{flow.get('name')}[/white] "
-            "now fires with the new answers."], "good")
+            "now uses the new guided setup."], "good")
     return True
 
 
@@ -535,11 +660,11 @@ def _delete_flow(ctx, flows):
 # ------------------------------------------------------------
 
 def workflow_engine(ctx, *, index):
-    """List, run, new, re-record, delete. Nothing else."""
+    """List, run, create, reconfigure, and delete workflows."""
     while True:
         flows = load_workflows()
         console.print()
-        screen_title("WORKFLOW ENGINE", "chained ops with pre-set inputs")
+        screen_title("WORKFLOW ENGINE", "guided, reusable operation chains")
         if not flows:
             console.print("  [dim]no workflows yet. N makes one.[/dim]")
         for i, f in enumerate(flows, 1):
@@ -547,7 +672,7 @@ def workflow_engine(ctx, *, index):
             preset = sum(len(s.get("answers") or []) for s in steps)
             console.print(
                 f"  [orange][{i}][/orange] [white]{f.get('name')}[/white] "
-                f"[dim]{len(steps)} ops | {preset} pre-set inputs | "
+                f"[dim]{len(steps)} ops | {preset} saved inputs | "
                 f"{trigger_summary(f)}[/dim]")
             chain = " -> ".join(
                 (index.get(s.get("op", "")) or {}).get("name", s.get("op", "?"))
@@ -555,7 +680,7 @@ def workflow_engine(ctx, *, index):
             if chain:
                 console.print(f"      [dim]{chain[:200]}[/dim]")
         console.print()
-        console.print("  [dim]# run | N new | E re-record step inputs | D delete | B back[/dim]")
+        console.print("  [dim]# run | N new | E reconfigure step | D delete | B back[/dim]")
         raw = ask("action").strip()
         low = raw.lower()
         if low in ("b", "", "q"):
@@ -579,7 +704,7 @@ def workflow_engine(ctx, *, index):
 def page_ops():
     """The WORKFLOWS page exposes exactly one entry: the engine itself."""
     return [
-        ("Workflow Engine", "chained ops, pre-set inputs, one trigger", workflow_engine),
+        ("Workflow Engine", "guided operation chains with reusable setup", workflow_engine),
     ]
 
 
@@ -688,12 +813,29 @@ def _run_steps(ctx, index, steps, path, board, by_id, taken, cache, state):
             board.suspend()
             # Replay the answers recorded at build time. When the recording
             # runs dry, prompts fall through to live input automatically.
-            set_input_feed(deque(step.get("answers") or []))
+            feed = deque(step.get("answers") or [])
+            set_input_feed(feed, strict=True)
             try:
                 entry["fn"](ctx)
+                if feed:
+                    raise InputReplayError(
+                        f"{len(feed)} saved input(s) were not used by the current flow"
+                    )
                 if bi is not None:
                     board.done(bi)
                 ctx.logger.log("WF_STEP", entry["name"])
+            except InputReplayError as e:
+                if bi is not None:
+                    board.fail(bi, "saved setup is stale")
+                ctx.logger.log("WF_ERROR", f"{entry['name']} | stale inputs | {e}")
+                notice(
+                    "STEP NEEDS SETUP",
+                    [f"[white]{entry['name']}[/white] changed since this workflow was saved.",
+                     str(e), "re-run guided setup for this step."],
+                    "warn",
+                )
+                if stop_on_error:
+                    return True
             except ApiNetworkError as e:
                 if bi is not None:
                     board.fail(bi, str(e)[:60])

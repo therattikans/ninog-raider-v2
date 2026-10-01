@@ -21,7 +21,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -320,14 +320,52 @@ PERMISSION_BITS = {
     "ADMINISTRATOR": 1 << 3,
     "MANAGE_CHANNELS": 1 << 4,
     "MANAGE_GUILD": 1 << 5,
+    "ADD_REACTIONS": 1 << 6,
     "VIEW_AUDIT_LOG": 1 << 7,
+    "PRIORITY_SPEAKER": 1 << 8,
+    "STREAM": 1 << 9,
     "VIEW_CHANNEL": 1 << 10,
     "SEND_MESSAGES": 1 << 11,
+    "SEND_TTS_MESSAGES": 1 << 12,
     "MANAGE_MESSAGES": 1 << 13,
+    "EMBED_LINKS": 1 << 14,
+    "ATTACH_FILES": 1 << 15,
+    "READ_MESSAGE_HISTORY": 1 << 16,
+    "MENTION_EVERYONE": 1 << 17,
+    "USE_EXTERNAL_EMOJIS": 1 << 18,
+    "VIEW_GUILD_INSIGHTS": 1 << 19,
+    "CONNECT": 1 << 20,
+    "SPEAK": 1 << 21,
+    "MUTE_MEMBERS": 1 << 22,
+    "DEAFEN_MEMBERS": 1 << 23,
+    "MOVE_MEMBERS": 1 << 24,
+    "USE_VAD": 1 << 25,
+    "CHANGE_NICKNAME": 1 << 26,
     "MANAGE_NICKNAMES": 1 << 27,
     "MANAGE_ROLES": 1 << 28,
     "MANAGE_WEBHOOKS": 1 << 29,
+    "MANAGE_GUILD_EXPRESSIONS": 1 << 30,
+    "USE_APPLICATION_COMMANDS": 1 << 31,
+    "REQUEST_TO_SPEAK": 1 << 32,
+    "MANAGE_EVENTS": 1 << 33,
+    "MANAGE_THREADS": 1 << 34,
+    "CREATE_PUBLIC_THREADS": 1 << 35,
+    "CREATE_PRIVATE_THREADS": 1 << 36,
+    "USE_EXTERNAL_STICKERS": 1 << 37,
+    "SEND_MESSAGES_IN_THREADS": 1 << 38,
+    "USE_EMBEDDED_ACTIVITIES": 1 << 39,
     "MODERATE_MEMBERS": 1 << 40,
+    "VIEW_CREATOR_MONETIZATION_ANALYTICS": 1 << 41,
+    "USE_SOUNDBOARD": 1 << 42,
+    "CREATE_GUILD_EXPRESSIONS": 1 << 43,
+    "CREATE_EVENTS": 1 << 44,
+    "USE_EXTERNAL_SOUNDS": 1 << 45,
+    "SEND_VOICE_MESSAGES": 1 << 46,
+    "SET_VOICE_CHANNEL_STATUS": 1 << 48,
+    "SEND_POLLS": 1 << 49,
+    "USE_EXTERNAL_APPS": 1 << 50,
+    "PIN_MESSAGES": 1 << 51,
+    "BYPASS_SLOWMODE": 1 << 52,
 }
 
 
@@ -408,7 +446,8 @@ class RateLimiter:
         self.max_5xx = 2
 
         self._last = 0.0
-        self._bucket_until = 0.0
+        self._bucket_until = {}
+        self._route_buckets = {}
         self._global_until = 0.0
         self._lock = threading.RLock()
 
@@ -432,67 +471,107 @@ class RateLimiter:
             with self._lock:
                 self.slept_for += seconds
 
-    def acquire(self):
-        """Block until the next request is allowed. No-op when disabled."""
+    @staticmethod
+    def _bucket_identity(bucket_hash, route):
+        match = re.search(r"/(channels|guilds)/([0-9]+)", route or "")
+        if not match:
+            match = re.search(r"/webhooks/([0-9]+)(?:/([^/? ]+))?", route or "")
+        scope = match.group(0) if match else "global-route"
+        return f"{bucket_hash}|{scope}"
+
+    def _bucket_key(self, route):
+        return self._route_buckets.get(route, route or "default")
+
+    def acquire(self, route=None):
+        """Block until this route and the global limiter allow a request."""
         if not self.enabled:
             return
-        with self._lock:
-            now = time.monotonic()
-            target = now
-            if self.spacing > 0:
-                target = max(target, self._last + self.spacing)
-            if self.wait_until:
-                target = max(target, self._bucket_until)
-            if self.global_wait:
-                target = max(target, self._global_until)
-            if target > now:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                target = now
+                if self.spacing > 0:
+                    target = max(target, self._last + self.spacing)
+                if self.wait_until:
+                    target = max(
+                        target,
+                        self._bucket_until.get(self._bucket_key(route), 0.0),
+                    )
+                if self.global_wait:
+                    target = max(target, self._global_until)
+                delay = target - now
+                if delay <= 0:
+                    self._last = now
+                    return
                 self.waits += 1
-                self.sleep_for(target - now)
-            self._last = time.monotonic()
+            self.sleep_for(delay)
 
-    def note_response(self, r):
-        """Read bucket headers off a non-429 response and schedule the wait."""
+    def note_response(self, response, route=None):
+        """Track Discord's bucket hash and reset deadline for one route."""
         if not self.enabled or not self.wait_until:
             return
-        if r.headers.get("X-RateLimit-Remaining") != "0":
+        bucket_hash = response.headers.get("X-RateLimit-Bucket")
+        with self._lock:
+            if bucket_hash and route:
+                old_key = self._bucket_key(route)
+                bucket_key = self._bucket_identity(bucket_hash, route)
+                self._route_buckets[route] = bucket_key
+                if old_key in self._bucket_until:
+                    self._bucket_until[bucket_key] = max(
+                        self._bucket_until.get(bucket_key, 0.0),
+                        self._bucket_until.pop(old_key),
+                    )
+            key = self._bucket_key(route)
+        if response.headers.get("X-RateLimit-Remaining") != "0":
             return
-        reset_after = r.headers.get("X-RateLimit-Reset-After")
-        reset_at = r.headers.get("X-RateLimit-Reset")
+        reset_after = response.headers.get("X-RateLimit-Reset-After")
+        reset_at = response.headers.get("X-RateLimit-Reset")
         until = None
         if reset_after:
             try:
                 until = time.monotonic() + float(reset_after)
             except (TypeError, ValueError):
-                until = None
+                pass
         elif reset_at:
-            # Reset is an epoch timestamp on Discord's clock; convert the
-            # remaining wall-clock delta into monotonic time.
             try:
-                until = time.monotonic() + (float(reset_at) - time.time())
+                until = time.monotonic() + max(0.0, float(reset_at) - time.time())
             except (TypeError, ValueError):
-                until = None
+                pass
         if until is not None:
-            self._bucket_until = max(self._bucket_until, until + self.safety)
+            with self._lock:
+                self._bucket_until[key] = max(
+                    self._bucket_until.get(key, 0.0), until + self.safety
+                )
 
-    def note_429(self, r):
+    def note_429(self, response, route=None):
         """Record a 429 and return how long to sleep before retrying."""
-        self.hit_429 += 1
+        with self._lock:
+            self.hit_429 += 1
         try:
-            body = r.json()
+            body = response.json()
         except Exception:
             body = {}
-        raw = body.get("retry_after") or r.headers.get("Retry-After") or 1.0
+        raw = body.get("retry_after") or response.headers.get("Retry-After") or 1.0
         try:
-            retry = float(raw)
+            retry = max(0.0, float(raw))
         except (TypeError, ValueError):
             retry = 1.0
         is_global = bool(body.get("global")) or \
-            str(r.headers.get("X-RateLimit-Global", "")).lower() == "true"
+            str(response.headers.get("X-RateLimit-Global", "")).lower() == "true"
         until = time.monotonic() + retry + self.safety
-        if is_global:
-            self._global_until = max(self._global_until, until)
-        else:
-            self._bucket_until = max(self._bucket_until, until)
+        with self._lock:
+            if is_global:
+                self._global_until = max(self._global_until, until)
+            else:
+                bucket_hash = response.headers.get("X-RateLimit-Bucket")
+                if bucket_hash and route:
+                    self._route_buckets[route] = self._bucket_identity(
+                        bucket_hash, route
+                    )
+                key = self._bucket_key(route)
+                self._bucket_until[key] = max(
+                    self._bucket_until.get(key, 0.0), until
+                )
         return retry + self.safety
 
     def snapshot(self):
@@ -538,12 +617,24 @@ class DiscordREST:
         # before a vault entry exists).
         self.limiter = RateLimiter(config=config, safety=safety)
 
+    @staticmethod
+    def _route_key(method, path):
+        parts = [part for part in urlparse(path).path.split("/") if part]
+        for index, part in enumerate(parts):
+            if not part.isdigit():
+                continue
+            major = index > 0 and parts[index - 1] in {"channels", "guilds", "webhooks"}
+            if not major:
+                parts[index] = ":id"
+        return f"{method.upper()} /{'/'.join(parts)}"
+
     def _throttle(self):
         self.limiter.acquire()
 
     def request(self, method, path, *, params=None, body=None, reason="", _attempt=0):
         lim = self.limiter
-        lim.acquire()
+        route = self._route_key(method, path)
+        lim.acquire(route)
         headers = None
         if reason:
             headers = {"X-Audit-Log-Reason": quote(str(reason)[:512], safe="")}
@@ -572,7 +663,7 @@ class DiscordREST:
                         "RATE_LIMIT", f"429 giving up after {_attempt} | {method} {path}"
                     )
                 return r
-            wait = lim.note_429(r)
+            wait = lim.note_429(r, route)
             if self.logger:
                 self.logger.log(
                     "RATE_LIMIT",
@@ -584,7 +675,7 @@ class DiscordREST:
                 _attempt=_attempt + 1
             )
 
-        lim.note_response(r)
+        lim.note_response(r, route)
 
         if r.status_code >= 500 and _attempt < lim.max_5xx:
             lim.sleep_for(min(4.0, 2 ** _attempt))
@@ -668,6 +759,20 @@ class DiscordREST:
     def modify_member(self, guild_id, user_id, body):
         return self.request("PATCH", f"/guilds/{guild_id}/members/{user_id}", body=body)
 
+    def add_member_role(self, guild_id, user_id, role_id, reason=""):
+        return self.request(
+            "PUT",
+            f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+            reason=reason,
+        )
+
+    def remove_member_role(self, guild_id, user_id, role_id, reason=""):
+        return self.request(
+            "DELETE",
+            f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+            reason=reason,
+        )
+
     def kick_member(self, guild_id, user_id):
         return self.request("DELETE", f"/guilds/{guild_id}/members/{user_id}")
 
@@ -678,6 +783,20 @@ class DiscordREST:
             "PUT",
             f"/guilds/{guild_id}/bans/{user_id}",
             body={"delete_message_seconds": int(delete_message_seconds)},
+        )
+
+    def bulk_ban(self, guild_id, user_ids, delete_message_seconds=0, reason=""):
+        ids = [str(user_id) for user_id in user_ids][:200]
+        return self.request(
+            "POST",
+            f"/guilds/{guild_id}/bulk-ban",
+            body={
+                "user_ids": ids,
+                "delete_message_seconds": max(
+                    0, min(604800, int(delete_message_seconds))
+                ),
+            },
+            reason=reason,
         )
 
     def unban_member(self, guild_id, user_id):
@@ -748,32 +867,43 @@ class DiscordREST:
         return self.request("DELETE", f"/webhooks/{webhook_id}")
 
     def execute_webhook(self, webhook_url, body, _attempt=0):
+        if not is_discord_webhook_url(webhook_url):
+            raise ApiNetworkError("invalid Discord webhook URL")
         # Webhook execution does not go through request() because the URL is
         # absolute rather than an API path, so the limiter is applied here by
         # hand. Skipping this was how webhook spam escaped pacing entirely.
         lim = self.limiter
-        lim.acquire()
+        route = self._route_key("POST", webhook_url)
+        lim.acquire(route)
         try:
-            r = self.external.post(webhook_url, json=body, timeout=lim.timeout)
+            r = self.external.post(
+                webhook_url,
+                params={"wait": "true"},
+                json=body,
+                timeout=lim.timeout,
+            )
         except requests.RequestException as e:
             raise ApiNetworkError(f"webhook failed: {e}") from e
         if r.status_code == 429:
             if not lim.enabled or _attempt >= lim.max_429:
                 return r
-            wait = lim.note_429(r)
+            wait = lim.note_429(r, route)
             lim.sleep_for(wait)
             return self.execute_webhook(webhook_url, body, _attempt + 1)
-        lim.note_response(r)
+        lim.note_response(r, route)
         return r
 
     def delete_webhook_by_url(self, webhook_url):
+        if not is_discord_webhook_url(webhook_url):
+            raise ApiNetworkError("invalid Discord webhook URL")
         lim = self.limiter
-        lim.acquire()
+        route = self._route_key("DELETE", webhook_url)
+        lim.acquire(route)
         try:
             r = self.external.delete(webhook_url, timeout=lim.timeout)
         except requests.RequestException as e:
             raise ApiNetworkError(f"webhook delete failed: {e}") from e
-        lim.note_response(r)
+        lim.note_response(r, route)
         return r
 
     def get_dm_channels(self):
@@ -790,11 +920,18 @@ class DiscordREST:
     def put_onboarding(self, guild_id, body):
         return self.request("PUT", f"/guilds/{guild_id}/onboarding", body=body)
 
-    def create_invite(self, channel_id, max_age=86400):
+    def create_invite(
+        self, channel_id, max_age=86400, max_uses=0, temporary=False, unique=True
+    ):
         return self.request(
             "POST",
             f"/channels/{channel_id}/invites",
-            body={"max_age": max_age, "max_uses": 0},
+            body={
+                "max_age": max(0, min(604800, int(max_age))),
+                "max_uses": max(0, min(100, int(max_uses))),
+                "temporary": bool(temporary),
+                "unique": bool(unique),
+            },
         )
 
     def download(self, url, timeout=25):
@@ -878,6 +1015,19 @@ class GuildWatchdog:
                         pass
                 return
             self._stop.wait(self.interval)
+
+
+def is_discord_webhook_url(url):
+    try:
+        parsed = urlparse(str(url))
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and host in {"discord.com", "www.discord.com", "discordapp.com", "www.discordapp.com"}
+        and re.fullmatch(r"/api(?:/v\d+)?/webhooks/\d+/[^/]+/?", parsed.path) is not None
+    )
 
 
 def webhook_url_of(hook):

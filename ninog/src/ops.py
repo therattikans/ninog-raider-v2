@@ -35,6 +35,7 @@ from .core import (
     copy_to_clipboard,
     dm_send,
     fetch_online_ids,
+    is_discord_webhook_url,
     load_tokens,
     load_whitelist,
     save_tokens,
@@ -45,7 +46,7 @@ from .core import (
     webhook_url_of,
     whitelist_ids,
 )
-from .workflow import build_index, page_ops, run_due_workflows
+from .workflow import build_index, missing_perms, page_ops, run_due_workflows, slugify
 from .ui import (
     LAYOUTS,
     RATE_LEVELS,
@@ -735,10 +736,14 @@ def image_to_data_uri(ctx, url):
 
 def restore_roles(ctx, blob):
     rest, gid = ctx.rest, ctx.guild["id"]
-    roles = [r for r in blob.get("roles", []) if not r.get("managed") and r.get("id") != gid]
-    roles.sort(key=lambda r: r.get("position", 0))
+    source_gid = str((blob.get("guild") or {}).get("id", ""))
+    roles = [
+        role for role in blob.get("roles", [])
+        if not role.get("managed") and str(role.get("id")) != source_gid
+    ]
+    roles.sort(key=lambda role: role.get("position", 0))
 
-    id_map = {}
+    id_map = {source_gid: gid} if source_gid else {}
     created = failed = 0
     with console.status(f"[orange]recreating {len(roles)} roles...[/orange]") as status:
         for i, r in enumerate(roles):
@@ -746,7 +751,11 @@ def restore_roles(ctx, blob):
             body = {
                 "name": r.get("name", "role"),
                 "permissions": r.get("permissions", "0"),
-                "color": r.get("color", 0),
+                "colors": r.get("colors") or {
+                    "primary_color": r.get("color", 0),
+                    "secondary_color": None,
+                    "tertiary_color": None,
+                },
                 "hoist": r.get("hoist", False),
                 "mentionable": r.get("mentionable", False),
             }
@@ -760,6 +769,8 @@ def restore_roles(ctx, blob):
     if id_map:
         positions = []
         for old_id, new_id in id_map.items():
+            if old_id == source_gid:
+                continue
             old = next((r for r in blob.get("roles", []) if r.get("id") == old_id), None)
             if old:
                 positions.append({"id": new_id, "position": old.get("position", 1)})
@@ -848,6 +859,44 @@ def restore_channels(ctx, blob, role_map):
     return id_map
 
 
+def restore_member_roles(ctx, blob, role_map):
+    rest, gid = ctx.rest, ctx.guild["id"]
+    response, current_members = rest.get_all_members(gid)
+    if response.status_code != 200:
+        console.print(f"[warn]member roles | skipped ({response.status_code})[/warn]")
+        return
+    current_ids = {
+        (member.get("user") or {}).get("id") for member in current_members
+    }
+    assignments = []
+    for member in blob.get("members", []):
+        user_id = member.get("id")
+        if not user_id or user_id not in current_ids:
+            continue
+        for old_role_id in member.get("roles", []):
+            new_role_id = role_map.get(old_role_id)
+            if new_role_id and new_role_id != gid:
+                assignments.append((user_id, new_role_id))
+    applied = failed = 0
+    with console.status(f"[orange]restoring {len(assignments)} member role assignments...[/orange]") as status:
+        for i, (user_id, role_id) in enumerate(assignments):
+            status.update(f"[orange]member roles {i + 1}/{len(assignments)}[/orange]")
+            result = rest.add_member_role(
+                gid, user_id, role_id, reason="NiNog Raker restore"
+            )
+            if result.status_code in (200, 204):
+                applied += 1
+            else:
+                failed += 1
+    ctx.logger.log(
+        "OP_RESULT", f"restore_member_roles | applied={applied} failed={failed}"
+    )
+    console.print(
+        f"[dim]member roles |[/dim] [white]{applied}[/white] [dim]applied |[/dim] "
+        f"[white]{failed}[/white] [dim]failed[/dim]"
+    )
+
+
 def restore_settings(ctx, blob, channel_map, role_map):
     rest, gid = ctx.rest, ctx.guild["id"]
     s = blob.get("settings", {})
@@ -906,19 +955,22 @@ def restore_onboarding(ctx, blob, channel_map, role_map):
         for o in p.get("options", []):
             chan_ids = [channel_map[c] for c in o.get("channel_ids", []) if c in channel_map]
             role_ids = [role_map[r] for r in o.get("role_ids", []) if r in role_map]
+            emoji = o.get("emoji") or {}
             options.append(
                 {
-                    "id": o.get("id"),
+                    "id": 0,
                     "title": o.get("title"),
                     "description": o.get("description") or "",
-                    "emoji": o.get("emoji") or {},
+                    "emoji_id": emoji.get("id"),
+                    "emoji_name": emoji.get("name"),
+                    "emoji_animated": bool(emoji.get("animated", False)),
                     "channel_ids": chan_ids,
                     "role_ids": role_ids,
                 }
             )
         prompts.append(
             {
-                "id": p.get("id"),
+                "id": 0,
                 "title": p.get("title"),
                 "type": p.get("type", 0),
                 "options": options,
@@ -930,8 +982,12 @@ def restore_onboarding(ctx, blob, channel_map, role_map):
 
     default_ids = [channel_map[c] for c in onb.get("default_channel_ids", [])
                    if c in channel_map]
-    body = {"prompts": prompts, "default_channel_ids": default_ids,
-            "enabled": onb.get("enabled", False)}
+    body = {
+        "prompts": prompts,
+        "default_channel_ids": default_ids,
+        "enabled": onb.get("enabled", False),
+        "mode": onb.get("mode", 0),
+    }
 
     r = rest.put_onboarding(gid, body)
     ctx.logger.log("OP_RESULT", f"restore_onboarding | {r.status_code}")
@@ -980,7 +1036,11 @@ def restore_messages(ctx, blob, channel_map):
                 try:
                     resp = rest.execute_webhook(
                         url,
-                        {"content": content[:2000], "username": m.get("author", "unknown")},
+                        {
+                            "content": content[:2000],
+                            "username": str(m.get("author", "unknown"))[:80],
+                            "allowed_mentions": {"parse": []},
+                        },
                     )
                     if resp.status_code in (200, 204):
                         replayed += 1
@@ -1049,6 +1109,7 @@ def print_member_note_and_invite(ctx, blob, channel_map):
 
 
 def run_restore(ctx, scope):
+    rest = ctx.rest
     blob = pick_snapshot(ctx)
     if blob is None:
         return
@@ -1067,10 +1128,19 @@ def run_restore(ctx, scope):
     if not confirm("proceed?"):
         return
 
-    role_map = {}
+    source_gid = str((blob.get("guild") or {}).get("id", ""))
+    role_map = {source_gid: ctx.guild["id"]} if source_gid else {}
     channel_map = {}
+    if scope == "settings":
+        current_channels = rest.get_channels(ctx.guild["id"])
+        if current_channels.status_code == 200:
+            channel_map = {channel["id"]: channel["id"] for channel in current_channels.json()}
+        current_roles = rest.get_roles(ctx.guild["id"])
+        if current_roles.status_code == 200:
+            role_map.update({role["id"]: role["id"] for role in current_roles.json()})
     if scope in ("full", "roles"):
         role_map = restore_roles(ctx, blob)
+        restore_member_roles(ctx, blob, role_map)
     if scope in ("full", "channels"):
         channel_map = restore_channels(ctx, blob, role_map)
     if scope in ("full", "settings"):
@@ -1089,14 +1159,45 @@ def run_restore(ctx, scope):
 # SECTION 5 | OFFENCE OPS
 # ------------------------------------------------------------
 
+def _hierarchy_context(ctx):
+    """Return role positions and the bot's highest role position."""
+    gid = ctx.guild["id"]
+    roles_response = ctx.rest.get_roles(gid)
+    member_response = ctx.rest.get_member(gid, ctx.me["id"])
+    if roles_response.status_code != 200 or member_response.status_code != 200:
+        return None, None
+    positions = {
+        role.get("id"): int(role.get("position", 0))
+        for role in roles_response.json()
+    }
+    bot_roles = member_response.json().get("roles", [])
+    bot_top = max((positions.get(role_id, 0) for role_id in bot_roles), default=0)
+    return positions, bot_top
+
+
+def _filter_members_by_hierarchy(ctx, members):
+    positions, bot_top = _hierarchy_context(ctx)
+    if positions is None:
+        return members, 0
+    allowed, skipped = [], 0
+    for member in members:
+        highest = max(
+            (positions.get(role_id, 0) for role_id in member.get("roles", [])),
+            default=0,
+        )
+        if highest >= bot_top:
+            skipped += 1
+        else:
+            allowed.append(member)
+    return allowed, skipped
+
+
 def op_ban_all(ctx):
     rest, guild = ctx.rest, ctx.guild
     gid = guild["id"]
     me_id = ctx.me.get("id")
     owner_id = guild.get("owner_id")
     wl = whitelist_ids()
-
-    ensure_pre_op_snapshot(ctx, "BAN ALL")
 
     r, members = rest.get_all_members(gid)
     if r.status_code == 403:
@@ -1116,31 +1217,69 @@ def op_ban_all(ctx):
             continue
         targets.append(m)
 
+    targets, skipped_hierarchy = _filter_members_by_hierarchy(ctx, targets)
     if not targets:
-        notice("NOTHING TO BAN", ["no bannable members found."], "warn")
+        notice("NOTHING TO BAN", ["no members are below the bot's highest role."], "warn")
         return
-    extra = f" | [white]{skipped_wl}[/white] whitelisted skipped" if skipped_wl else ""
+    skipped = []
+    if skipped_wl:
+        skipped.append(f"{skipped_wl} whitelisted")
+    if skipped_hierarchy:
+        skipped.append(f"{skipped_hierarchy} blocked by role hierarchy")
+    extra = f" | [white]{', '.join(skipped)}[/white] skipped" if skipped else ""
     if not confirm(f"ban [white]{len(targets)}[/white] members{extra}?"):
         return
+    ensure_pre_op_snapshot(ctx, "BAN ALL")
 
     banned = failed = 0
+    can_bulk = bool(
+        ctx.perms & PERMISSION_BITS["ADMINISTRATOR"]
+        or ctx.perms & PERMISSION_BITS["MANAGE_GUILD"]
+    )
     with console.status(f"[orange]banning {len(targets)} members...[/orange]") as status:
-        for i, m in enumerate(targets):
-            uid = m["user"]["id"]
-            status.update(
-                f"[orange]banning {i + 1}/{len(targets)} | {bot_display(m['user'])}[/orange]"
-            )
-            resp = rest.ban_member(gid, uid)
-            if resp.status_code in (200, 204):
-                banned += 1
-            else:
-                failed += 1
+        if can_bulk:
+            ids = [member["user"]["id"] for member in targets]
+            for offset in range(0, len(ids), 200):
+                batch = ids[offset : offset + 200]
+                status.update(
+                    f"[orange]bulk banning {offset + 1}-{offset + len(batch)}/{len(ids)}[/orange]"
+                )
+                response = rest.bulk_ban(
+                    gid, batch, reason="NiNog Raker ban all"
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    result = payload if isinstance(payload, dict) else {}
+                    batch_banned = len(result.get("banned_users", []))
+                    batch_failed = len(result.get("failed_users", []))
+                    # A malformed success body must not turn into a false success.
+                    banned += batch_banned
+                    failed += batch_failed + max(0, len(batch) - batch_banned - batch_failed)
+                else:
+                    failed += len(batch)
+        else:
+            for i, member in enumerate(targets):
+                uid = member["user"]["id"]
+                status.update(
+                    f"[orange]banning {i + 1}/{len(targets)} | "
+                    f"{bot_display(member['user'])}[/orange]"
+                )
+                response = rest.ban_member(gid, uid)
+                if response.status_code in (200, 204):
+                    banned += 1
+                else:
+                    failed += 1
 
-    ctx.logger.log("OP_RESULT",
-                   f"ban_all | banned={banned} failed={failed} wl_skipped={skipped_wl}")
+    ctx.logger.log(
+        "OP_RESULT",
+        f"ban_all | banned={banned} failed={failed} wl_skipped={skipped_wl} "
+        f"hierarchy_skipped={skipped_hierarchy}",
+    )
     console.print(
         f"[dim]done |[/dim] [white]{banned}[/white] [dim]banned |[/dim] "
-        f"[white]{failed}[/white] [dim]failed |[/dim] [white]{skipped_wl}[/white] [dim]whitelist skipped[/dim]"
+        f"[white]{failed}[/white] [dim]failed |[/dim] [white]{skipped_wl}[/white] "
+        f"[dim]whitelist skipped |[/dim] [white]{skipped_hierarchy}[/white] "
+        f"[dim]hierarchy skipped[/dim]"
     )
 
 
@@ -1180,7 +1319,6 @@ def op_unban_all(ctx):
 
 def op_wipe_channels(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "WIPE CHANNELS")
 
     r = rest.get_channels(gid)
     if r.status_code != 200:
@@ -1192,6 +1330,7 @@ def op_wipe_channels(ctx):
         return
     if not confirm(f"delete ALL [white]{len(channels)}[/white] channels?"):
         return
+    ensure_pre_op_snapshot(ctx, "WIPE CHANNELS")
 
     deleted = failed = 0
     with console.status(f"[orange]deleting {len(channels)} channels...[/orange]") as status:
@@ -1212,13 +1351,21 @@ def op_wipe_channels(ctx):
 
 def op_flood_channels(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "FLOOD CHANNELS")
 
     name = ask("channel name", "raker")
+    name = (name or "").strip()[:90]
     if not name:
         return
-    count = ask_int("how many", 50)
-    count = max(1, min(500, count))
+    current = rest.get_channels(gid)
+    if current.status_code != 200:
+        notice("API ERROR", [f"could not read channel capacity | {current.status_code}"], "bad")
+        return
+    room = max(0, 500 - len(current.json()))
+    if room == 0:
+        notice("CHANNEL LIMIT", ["this guild already has 500 channels."], "warn")
+        return
+    count = ask_int(f"how many (1-{room})", min(50, room))
+    count = max(1, min(room, count))
     ctype = ask_int("type (0 text / 2 voice)", 0)
     ctype = 0 if ctype != 2 else 2
     if not confirm(f"create [white]{count}[/white] channels named [white]{name}[/white]?"):
@@ -1243,18 +1390,30 @@ def op_flood_channels(ctx):
 
 def op_wipe_roles(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "WIPE ROLES")
 
     r = rest.get_roles(gid)
     if r.status_code != 200:
         notice("API ERROR", [f"status {r.status_code}"], "bad")
         return
-    roles = [x for x in r.json() if x.get("id") != gid and not x.get("managed")]
+    all_roles = r.json()
+    positions, bot_top = _hierarchy_context(ctx)
+    roles = [
+        role for role in all_roles
+        if role.get("id") != gid
+        and not role.get("managed")
+        and (positions is None or int(role.get("position", 0)) < bot_top)
+    ]
+    hierarchy_skipped = sum(
+        1 for role in all_roles
+        if role.get("id") != gid and not role.get("managed") and role not in roles
+    )
     if not roles:
-        notice("EMPTY", ["no deletable roles."], "warn")
+        notice("EMPTY", ["no deletable roles below the bot's highest role."], "warn")
         return
-    if not confirm(f"delete ALL [white]{len(roles)}[/white] deletable roles?"):
+    suffix = f" | {hierarchy_skipped} above bot skipped" if hierarchy_skipped else ""
+    if not confirm(f"delete ALL [white]{len(roles)}[/white] manageable roles{suffix}?"):
         return
+    ensure_pre_op_snapshot(ctx, "WIPE ROLES")
 
     deleted = failed = 0
     with console.status(f"[orange]deleting {len(roles)} roles...[/orange]") as status:
@@ -1275,20 +1434,35 @@ def op_wipe_roles(ctx):
 
 def op_flood_roles(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "FLOOD ROLES")
 
     name = ask("role name", "raided")
+    name = (name or "").strip()[:90]
     if not name:
         return
-    count = ask_int("how many", 50)
-    count = max(1, min(500, count))
+    existing = rest.get_roles(gid)
+    if existing.status_code != 200:
+        notice("API ERROR", [f"could not read role capacity | {existing.status_code}"], "bad")
+        return
+    room = max(0, MAX_GUILD_ROLES - len(existing.json()))
+    if room == 0:
+        notice("ROLE LIMIT", [f"this guild already has {MAX_GUILD_ROLES} roles."], "warn")
+        return
+    count = ask_int(f"how many (1-{room})", min(50, room))
+    count = max(1, min(room, count))
     color = ask("color hex (e.g. FF6A00, blank = default)", "").lstrip("#")
+    if color and not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        notice("INVALID COLOR", ["use exactly six hexadecimal characters."], "warn")
+        return
     if not confirm(f"create [white]{count}[/white] roles named [white]{name}[/white]?"):
         return
 
     body = {"hoist": True, "mentionable": True}
     if re.fullmatch(r"[0-9a-fA-F]{6}", color or ""):
-        body["color"] = int(color, 16)
+        body["colors"] = {
+            "primary_color": int(color, 16),
+            "secondary_color": None,
+            "tertiary_color": None,
+        }
 
     created = failed = 0
     with console.status(f"[orange]creating {count} roles...[/orange]") as status:
@@ -1314,7 +1488,6 @@ def op_mass_kick(ctx):
     me_id = ctx.me.get("id")
     owner_id = guild.get("owner_id")
     wl = whitelist_ids()
-    ensure_pre_op_snapshot(ctx, "MASS KICK")
 
     r, members = rest.get_all_members(gid)
     if r.status_code == 403:
@@ -1334,12 +1507,19 @@ def op_mass_kick(ctx):
             continue
         targets.append(m)
 
+    targets, skipped_hierarchy = _filter_members_by_hierarchy(ctx, targets)
     if not targets:
-        notice("NOTHING TO KICK", ["no kickable members found."], "warn")
+        notice("NOTHING TO KICK", ["no members are below the bot's highest role."], "warn")
         return
-    extra = f" | [white]{skipped_wl}[/white] whitelisted skipped" if skipped_wl else ""
+    skipped = []
+    if skipped_wl:
+        skipped.append(f"{skipped_wl} whitelisted")
+    if skipped_hierarchy:
+        skipped.append(f"{skipped_hierarchy} blocked by role hierarchy")
+    extra = f" | [white]{', '.join(skipped)}[/white] skipped" if skipped else ""
     if not confirm(f"kick [white]{len(targets)}[/white] members{extra}?"):
         return
+    ensure_pre_op_snapshot(ctx, "MASS KICK")
 
     kicked = failed = 0
     with console.status(f"[orange]kicking {len(targets)} members...[/orange]") as status:
@@ -1354,23 +1534,29 @@ def op_mass_kick(ctx):
             else:
                 failed += 1
 
-    ctx.logger.log("OP_RESULT",
-                   f"mass_kick | kicked={kicked} failed={failed} wl_skipped={skipped_wl}")
+    ctx.logger.log(
+        "OP_RESULT",
+        f"mass_kick | kicked={kicked} failed={failed} wl_skipped={skipped_wl} "
+        f"hierarchy_skipped={skipped_hierarchy}",
+    )
     console.print(
         f"[dim]done |[/dim] [white]{kicked}[/white] [dim]kicked |[/dim] "
-        f"[white]{failed}[/white] [dim]failed |[/dim] [white]{skipped_wl}[/white] [dim]whitelist skipped[/dim]"
+        f"[white]{failed}[/white] [dim]failed |[/dim] [white]{skipped_wl}[/white] "
+        f"[dim]whitelist skipped |[/dim] [white]{skipped_hierarchy}[/white] "
+        f"[dim]hierarchy skipped[/dim]"
     )
 
 
 def op_rename_server(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "RENAME SERVER")
 
-    new_name = ask("new server name")
-    if not new_name:
+    new_name = (ask("new server name") or "").strip()
+    if not 2 <= len(new_name) <= 100:
+        notice("INVALID NAME", ["server names must be 2-100 characters."], "warn")
         return
     if not confirm(f"rename to [white]{new_name}[/white]?"):
         return
+    ensure_pre_op_snapshot(ctx, "RENAME SERVER")
     r = rest.patch_guild(gid, {"name": new_name})
     ok = r.status_code == 200
     ctx.logger.log("OP_RESULT", f"rename_server | {r.status_code} | {new_name}")
@@ -1448,7 +1634,7 @@ def _presence_order(ctx, members):
     return ordered, True
 
 
-def _browse_rows(rows, title, multi, page_size, note=""):
+def _browse_rows(rows, title, multi, page_size, note="", allow_create=False):
     """Paginated pick table. rows = [(markup, data)]. Returns [data] or None."""
     if not rows:
         notice("EMPTY", ["nothing to show here."], "warn")
@@ -1479,10 +1665,14 @@ def _browse_rows(rows, title, multi, page_size, note=""):
                       "[white]D[/white] done"]
         else:
             hints.append("[white]#[/white] select")
+        if allow_create:
+            hints.append("[white]C[/white] create")
         hints.append("[white]B[/white] back")
         raw = ask("  [dim]|[/dim]  ".join(hints)).lower().strip()
         if raw in ("b", "q"):
             return None
+        if allow_create and raw == "c":
+            return ["__create__"]
         if raw == "n" and len(pages) > 1:
             page_idx = (page_idx + 1) % len(pages)
             continue
@@ -1760,24 +1950,41 @@ def _role_permission_picker(ctx):
 
     keys = list(PERMISSION_BITS.keys())
     on = set()
+    page_size = 14
+    pages = chunk(keys, page_size)
+    page_idx = 0
     while True:
         console.print()
-        for i, k in enumerate(keys):
-            mark = "[orange][x][/orange]" if k in on else "[faint][ ][/faint]"
-            console.print(f"  {mark} [orange][{i + 1:02d}][/orange] [white]{k}[/white]")
-        raw = ask("toggle number | D done | B cancel").lower().strip()
+        page = pages[page_idx]
+        offset = page_idx * page_size
+        screen_title(
+            "CUSTOM PERMISSIONS",
+            f"page {page_idx + 1}/{len(pages)} · {len(on)} selected",
+        )
+        for i, key in enumerate(page):
+            number = offset + i + 1
+            mark = "[orange][x][/orange]" if key in on else "[faint][ ][/faint]"
+            console.print(f"  {mark} [orange][{number:02d}][/orange] [white]{key}[/white]")
+        raw = ask("toggle # | N next | P previous | D done | B cancel").lower().strip()
         if raw in ("b", "q"):
             return None
+        if raw == "n":
+            page_idx = (page_idx + 1) % len(pages)
+            continue
+        if raw == "p":
+            page_idx = (page_idx - 1) % len(pages)
+            continue
         if raw in ("d", ""):
             if not on:
-                notice("NONE", ["no permissions selected."], "warn")
+                notice("NONE", ["select at least one permission."], "warn")
                 continue
-            chosen = sorted(on)
+            chosen = sorted(on, key=keys.index)
             return chosen, _perm_bits(chosen)
         if raw.isdigit() and 1 <= int(raw) <= len(keys):
             on.symmetric_difference_update({keys[int(raw) - 1]})
+            page_idx = (int(raw) - 1) // page_size
             continue
-        notice("OUT OF RANGE", [f"1-{len(keys)} | D | B."], "warn")
+        notice("OUT OF RANGE", [f"1-{len(keys)} | N | P | D | B."], "warn")
 
 
 def _role_targets(ctx):
@@ -1970,19 +2177,15 @@ def op_role_engine(ctx):
             "hoist": hoist,
             "mentionable": False,
         }
-        if random_color:
-            body["color"] = random.randint(0, 0xFFFFFF)
-        elif fixed_color is not None:
-            body["color"] = fixed_color
+        if random_color or fixed_color is not None:
+            primary = random.randint(0, 0xFFFFFF) if random_color else fixed_color
+            body["colors"] = {
+                "primary_color": primary,
+                "secondary_color": None,
+                "tertiary_color": None,
+            }
         r = rest.create_role(gid, body, reason="NiNog Raker role engine")
         return r.json().get("id") if r.status_code in (200, 201) else None
-
-    def current_roles_of(n):
-        m = n.get("member")
-        if isinstance(m, dict) and "roles" in m:
-            return list(m.get("roles", []))
-        r = rest.get_member(gid, n["id"])
-        return list(r.json().get("roles", [])) if r.status_code == 200 else None
 
     with console.status("[orange]running role engine...[/orange]") as status:
         shared_id = None
@@ -2004,17 +2207,9 @@ def op_role_engine(ctx):
                     failed += 1
                     continue
                 created += 1
-            base = current_roles_of(n)
-            if base is None:
-                failed += 1
-                if separate and rid:
-                    rest.delete_role(gid, rid)   # never litter on failure
-                    created -= 1
-                continue
-            if rid in base:
-                assigned += 1   # already holds it (shared re-run)
-                continue
-            ar = rest.modify_member(gid, n["id"], {"roles": base + [rid]})
+            ar = rest.add_member_role(
+                gid, n["id"], rid, reason="NiNog Raker role engine"
+            )
             if ar.status_code in (200, 204):
                 assigned += 1
             else:
@@ -2117,7 +2312,6 @@ def op_scan_bots(ctx):
 
 def op_purge_messages(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "PURGE MESSAGES")
 
     r = rest.get_channels(gid)
     if r.status_code != 200:
@@ -2128,8 +2322,9 @@ def op_purge_messages(ctx):
     if not channels:
         notice("EMPTY", ["no text channels to purge."], "warn")
         return
-    if not confirm(f"purge recent messages in [white]{len(channels)}[/white] text channels?"):
+    if not confirm(f"purge the latest 100 messages in [white]{len(channels)}[/white] text channels?"):
         return
+    ensure_pre_op_snapshot(ctx, "PURGE MESSAGES")
 
     cutoff = datetime.now(timezone.utc).timestamp() - (14 * 86400)
     bulked = singled = failed_messages = failed_channels = 0
@@ -2192,33 +2387,48 @@ def op_purge_messages(ctx):
 
 def pick_text_channel(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    r = rest.get_channels(gid)
-    if r.status_code != 200:
-        notice("API ERROR", [f"status {r.status_code}"], "bad")
+    response = rest.get_channels(gid)
+    if response.status_code != 200:
+        notice("API ERROR", [f"status {response.status_code}"], "bad")
         return None
-    textish = {0, 5}
-    channels = [c for c in r.json() if c.get("type") in textish]
+    channels = [channel for channel in response.json() if channel.get("type") in {0, 5}]
     if not channels:
         notice("EMPTY", ["no text channels available."], "warn")
         return None
 
-    table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
-                  border_style="deep", padding=(0, 2))
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("NAME", style="white")
-    table.add_column("ID", style="dim")
-    for i, c in enumerate(channels):
-        table.add_row(str(i + 1), c.get("name", "?"), c.get("id", "?"))
-    console.print(table)
-
-    choice = ask(f"1-{len(channels)} select | B back").lower()
-    if choice == "b":
-        return None
-    if choice.isdigit() and 1 <= int(choice) <= len(channels):
-        return channels[int(choice) - 1]
-    notice("OUT OF RANGE", [f"expected 1-{len(channels)}."], "warn")
-    return None
-
+    page_size = max(5, min(50, int(ctx.config.setting("page_size", 10))))
+    pages = chunk(channels, page_size)
+    page_idx = 0
+    while True:
+        page = pages[page_idx]
+        offset = page_idx * page_size
+        table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
+                      border_style="deep", padding=(0, 2))
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("CHANNEL", style="white")
+        table.add_column("TYPE", style="dim")
+        table.add_column("ID", style="dim")
+        for i, channel in enumerate(page):
+            table.add_row(
+                str(offset + i + 1),
+                channel.get("name", "?"),
+                CHANNEL_TYPES.get(channel.get("type"), "text"),
+                channel.get("id", "?"),
+            )
+        console.print(table)
+        console.print(f"[dim]page {page_idx + 1}/{len(pages)} · {len(channels)} channels[/dim]")
+        choice = ask("channel # | N next | P previous | B back").lower()
+        if choice in ("b", "q", ""):
+            return None
+        if choice == "n" and len(pages) > 1:
+            page_idx = (page_idx + 1) % len(pages)
+            continue
+        if choice == "p" and len(pages) > 1:
+            page_idx = (page_idx - 1) % len(pages)
+            continue
+        if choice.isdigit() and 1 <= int(choice) <= len(channels):
+            return channels[int(choice) - 1]
+        notice("OUT OF RANGE", [f"expected 1-{len(channels)} | N | P | B."], "warn")
 
 def op_send_message(ctx):
     channel = pick_text_channel(ctx)
@@ -2252,13 +2462,22 @@ def op_dm_all(ctx):
         return
 
     me_id = ctx.me.get("id")
-    targets = [m for m in members
-               if not m.get("user", {}).get("bot")
-               and m.get("user", {}).get("id") != me_id]
+    protected = whitelist_ids()
+    targets = [
+        member for member in members
+        if not member.get("user", {}).get("bot")
+        and member.get("user", {}).get("id") != me_id
+        and member.get("user", {}).get("id") not in protected
+    ]
+    skipped = sum(
+        1 for member in members
+        if member.get("user", {}).get("id") in protected
+    )
     if not targets:
-        notice("EMPTY", ["no human members found."], "warn")
+        notice("EMPTY", ["no unprotected human members found."], "warn")
         return
-    if not confirm(f"DM [white]{len(targets)}[/white] members?"):
+    suffix = f" · {skipped} whitelisted skipped" if skipped else ""
+    if not confirm(f"DM [white]{len(targets)}[/white] members{suffix}?"):
         return
 
     sent = failed = 0
@@ -2280,12 +2499,12 @@ def op_dm_all(ctx):
 
 def op_create_webhooks(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
-    ensure_pre_op_snapshot(ctx, "MASS WEBHOOKS")
 
-    name = ask("webhook name", "raker")
-    if not name:
+    name = (ask("webhook name", "raker") or "").strip()
+    if not 1 <= len(name) <= 80:
+        notice("INVALID NAME", ["webhook names must be 1-80 characters."], "warn")
         return
-    per_channel = ask_int("webhooks per channel", 1)
+    per_channel = ask_int("webhooks per channel (1-10)", 1)
     per_channel = max(1, min(10, per_channel))
     r = rest.get_channels(gid)
     if r.status_code != 200:
@@ -2296,16 +2515,37 @@ def op_create_webhooks(ctx):
     if not channels:
         notice("EMPTY", ["no text channels available."], "warn")
         return
-    total = len(channels) * per_channel
+    plan = []
+    inaccessible = full = 0
+    with console.status("[orange]checking per-channel webhook capacity...[/orange]"):
+        for channel in channels:
+            hooks = rest.get_channel_webhooks(channel["id"])
+            if hooks.status_code != 200:
+                inaccessible += 1
+                continue
+            room = max(0, 15 - len(hooks.json()))
+            if room == 0:
+                full += 1
+                continue
+            plan.append((channel, min(per_channel, room)))
+    total = sum(count for _channel, count in plan)
+    if total == 0:
+        notice(
+            "NO CAPACITY",
+            [f"{full} channels are full · {inaccessible} channels are inaccessible."],
+            "warn",
+        )
+        return
     if not confirm(f"create [white]{total}[/white] webhooks across "
-                   f"[white]{len(channels)}[/white] channels?"):
+                   f"[white]{len(plan)}[/white] channels? "
+                   f"({full} full, {inaccessible} inaccessible)"):
         return
 
     created = failed = 0
     with console.status(f"[orange]creating {total} webhooks...[/orange]") as status:
-        for c in channels:
-            for j in range(per_channel):
-                status.update(f"[orange]{c.get('name')} | webhook {j + 1}/{per_channel}[/orange]")
+        for c, channel_count in plan:
+            for j in range(channel_count):
+                status.update(f"[orange]{c.get('name')} | webhook {j + 1}/{channel_count}[/orange]")
                 resp = rest.create_webhook(c["id"], name)
                 if resp.status_code in (200, 201):
                     created += 1
@@ -2325,30 +2565,37 @@ def op_webhook_spam(ctx):
     if r.status_code != 200:
         notice("API ERROR", [f"status {r.status_code} | needs MANAGE WEBHOOKS."], "bad")
         return
-    webhooks = r.json()
+    all_webhooks = r.json()
+    channels_response = rest.get_channels(gid)
+    channel_types = {
+        channel.get("id"): channel.get("type")
+        for channel in (channels_response.json() if channels_response.status_code == 200 else [])
+    }
+    webhooks = [(hook, webhook_url_of(hook)) for hook in all_webhooks]
+    webhooks = [
+        (hook, url) for hook, url in webhooks
+        if url and channel_types.get(hook.get("channel_id")) not in {15, 16}
+    ]
+    skipped_hooks = len(all_webhooks) - len(webhooks)
     if not webhooks:
-        notice("EMPTY", ["no webhooks on this server.",
-                         "create some first."], "warn")
+        notice("EMPTY", ["no executable incoming webhooks on this server."], "warn")
         return
 
-    content = ask("message to spam")
+    content = ask("message to send")
     if not content:
         return
     per_hook = ask_int("sends per webhook", 5)
     per_hook = max(1, min(100, per_hook))
     total = per_hook * len(webhooks)
     if not confirm(f"send [white]{total}[/white] messages via "
-                   f"[white]{len(webhooks)}[/white] webhooks?"):
+                   f"[white]{len(webhooks)}[/white] webhooks? "
+                   f"({skipped_hooks} non-executable skipped)"):
         return
 
     sent = failed = 0
-    with console.status(f"[orange]spamming {total} messages...[/orange]") as status:
+    with console.status(f"[orange]delivering {total} messages...[/orange]") as status:
         n = 0
-        for wh in webhooks:
-            url = webhook_url_of(wh)
-            if not url:
-                failed += per_hook
-                continue
+        for wh, url in webhooks:
             for j in range(per_hook):
                 n += 1
                 status.update(f"[orange]message {n}/{total} | {wh.get('name')}[/orange]")
@@ -2491,8 +2738,8 @@ def op_extract_webhooks(ctx):
 
         if raw == "3":
             dest = ask("destination webhook url")
-            if not dest or not dest.startswith("http"):
-                notice("BAD URL", ["needs a full https webhook url."], "warn")
+            if not is_discord_webhook_url(dest):
+                notice("BAD URL", ["enter a full Discord HTTPS webhook URL."], "warn")
                 continue
             # 2000-char message cap, one exact url per line, as many
             # messages as it takes so the list is never cut mid-url.
@@ -2542,12 +2789,24 @@ def op_create_invite(ctx):
     channel = pick_text_channel(ctx)
     if channel is None:
         return
-    r = ctx.rest.create_invite(channel["id"], max_age=86400)
+    hours = max(0, min(168, ask_int("lifetime in hours (0 = never, max 168)", 24)))
+    max_uses = max(0, min(100, ask_int("maximum uses (0 = unlimited, max 100)", 0)))
+    temporary = confirm("grant temporary membership?", False)
+    r = ctx.rest.create_invite(
+        channel["id"],
+        max_age=hours * 3600,
+        max_uses=max_uses,
+        temporary=temporary,
+        unique=True,
+    )
     if r.status_code == 200:
         code = r.json().get("code")
         ctx.logger.log("OP_RESULT", f"invite {channel.get('name')} {code}")
+        expiry = "never expires" if hours == 0 else f"expires in {hours}h"
+        uses = "unlimited uses" if max_uses == 0 else f"{max_uses} uses"
         notice("INVITE READY",
-               [f"[white]https://discord.gg/{code}[/white] [dim](24h)[/dim]"], "good")
+               [f"[white]https://discord.gg/{code}[/white]",
+                f"[dim]{expiry} · {uses}[/dim]"], "good")
     else:
         notice("FAILED", [f"status {r.status_code} | {r.text[:120]}"], "bad")
 
@@ -2593,6 +2852,17 @@ def op_member_lookup(ctx):
     ctx.logger.log("OP_RESULT", f"member_lookup {uid}")
 
 
+def _target_below_bot(ctx, target):
+    member = target.get("member")
+    if not isinstance(member, dict):
+        response = ctx.rest.get_member(ctx.guild["id"], target["id"])
+        if response.status_code != 200:
+            return None
+        member = response.json()
+    allowed, _skipped = _filter_members_by_hierarchy(ctx, [member])
+    return bool(allowed)
+
+
 def op_kick_member(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
     target = pick_one(ctx, "KICK MEMBER", allow_bots=True)
@@ -2601,6 +2871,10 @@ def op_kick_member(ctx):
     uid = target["id"]
     if uid in whitelist_ids():
         notice("WHITELISTED", ["this user is on the whitelist | remove them first."], "warn")
+        return
+    manageable = _target_below_bot(ctx, target)
+    if manageable is False:
+        notice("ROLE HIERARCHY", ["the target's highest role is not below the bot's."], "warn")
         return
     if not confirm(f"kick [white]{target['name']}[/white] ({uid})?"):
         return
@@ -2620,6 +2894,10 @@ def op_ban_member(ctx):
     uid = target["id"]
     if uid in whitelist_ids():
         notice("WHITELISTED", ["this user is on the whitelist | remove them first."], "warn")
+        return
+    manageable = _target_below_bot(ctx, target)
+    if manageable is False:
+        notice("ROLE HIERARCHY", ["the target's highest role is not below the bot's."], "warn")
         return
     days = ask_int("delete message history days (0-7)", 0)
     days = max(0, min(7, days))
@@ -2646,24 +2924,44 @@ def op_unban_member(ctx):
         notice("EMPTY", ["no bans on this server."], "good")
         return
 
-    table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
-                  border_style="deep", padding=(0, 2))
-    table.add_column("#", justify="right", style="dim")
-    table.add_column("USER", style="white")
-    table.add_column("ID", style="dim")
-    table.add_column("REASON", style="dim")
-    for i, b in enumerate(bans):
-        table.add_row(str(i + 1), bot_display(b.get("user", {})),
-                      b.get("user", {}).get("id", "?"), (b.get("reason") or "|")[:60])
-    console.print(table)
-
-    choice = ask(f"1-{len(bans)} unban | B back").lower()
-    if choice == "b":
+    page_size = max(5, min(50, int(ctx.config.setting("page_size", 10))))
+    pages = chunk(bans, page_size)
+    page_idx = 0
+    selected = None
+    while selected is None:
+        page = pages[page_idx]
+        offset = page_idx * page_size
+        table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
+                      border_style="deep", padding=(0, 2))
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("USER", style="white")
+        table.add_column("ID", style="dim")
+        table.add_column("REASON", style="dim")
+        for i, ban in enumerate(page):
+            table.add_row(
+                str(offset + i + 1),
+                bot_display(ban.get("user", {})),
+                ban.get("user", {}).get("id", "?"),
+                (ban.get("reason") or "|")[:60],
+            )
+        console.print(table)
+        console.print(f"[dim]page {page_idx + 1}/{len(pages)} · {len(bans)} bans[/dim]")
+        choice = ask("ban # | N next | P previous | B back").lower()
+        if choice in ("b", "q", ""):
+            return
+        if choice == "n" and len(pages) > 1:
+            page_idx = (page_idx + 1) % len(pages)
+            continue
+        if choice == "p" and len(pages) > 1:
+            page_idx = (page_idx - 1) % len(pages)
+            continue
+        if choice.isdigit() and 1 <= int(choice) <= len(bans):
+            selected = bans[int(choice) - 1]
+        else:
+            notice("OUT OF RANGE", [f"expected 1-{len(bans)} | N | P | B."], "warn")
+    uid = selected.get("user", {}).get("id")
+    if not confirm(f"unban [white]{bot_display(selected.get('user', {}))}[/white] ({uid})?"):
         return
-    if not (choice.isdigit() and 1 <= int(choice) <= len(bans)):
-        notice("OUT OF RANGE", [f"expected 1-{len(bans)}."], "warn")
-        return
-    uid = bans[int(choice) - 1].get("user", {}).get("id")
     rr = rest.unban_member(gid, uid)
     ok = rr.status_code in (200, 204)
     ctx.logger.log("OP_RESULT", f"unban_member {uid} | {rr.status_code}")
@@ -2712,127 +3010,175 @@ def op_view_ban_list(ctx):
     ctx.logger.log("OP_RESULT", f"view_ban_list | {len(bans)} bans")
 
 
+def _valid_resource_name(name):
+    return bool(name and 1 <= len(name) <= 100)
+
+
 def op_channel_control(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
+    page_size = max(5, min(50, int(ctx.config.setting("page_size", 10))))
     while True:
-        r = rest.get_channels(gid)
-        channels = r.json() if r.status_code == 200 else []
-        table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
-                      border_style="deep", padding=(0, 2))
-        table.add_column("#", justify="right", style="dim")
-        table.add_column("NAME", style="white")
-        table.add_column("TYPE", style="dim")
-        table.add_column("ID", style="dim")
-        for i, c in enumerate(channels):
-            table.add_row(str(i + 1), c.get("name", "?"),
-                          CHANNEL_TYPES.get(c.get("type"), str(c.get("type"))),
-                          c.get("id", "?"))
-        console.print(table)
-        choice = ask(f"1-{len(channels)} target | C create | B back").lower()
-        if choice == "b":
+        response = rest.get_channels(gid)
+        if response.status_code != 200:
+            notice("API ERROR", [f"could not read channels | {response.status_code}"], "bad")
             return
-        if choice == "c":
-            name = ask("channel name")
-            if not name:
+        channels = sorted(response.json(), key=lambda item: int(item.get("position", 0)))
+        if channels:
+            rows = [
+                (
+                    f"[white]{channel.get('name', '?')}[/white] [dim]| "
+                    f"{CHANNEL_TYPES.get(channel.get('type'), channel.get('type'))} | "
+                    f"{channel.get('id', '?')}[/dim]",
+                    channel,
+                )
+                for channel in channels
+            ]
+            picked = _browse_rows(
+                rows, "CHANNEL CONTROL", False, page_size,
+                note="select a channel to rename/delete, or C to create",
+                allow_create=True,
+            )
+            if picked is None:
+                return
+            target = picked[0]
+        else:
+            if not confirm("no channels exist | create one?", True):
+                return
+            target = "__create__"
+
+        if target == "__create__":
+            if len(channels) >= 500:
+                notice("CHANNEL LIMIT", ["this guild already has 500 channels."], "warn")
+                continue
+            name = (ask("channel name") or "").strip()
+            if not _valid_resource_name(name):
+                notice("INVALID NAME", ["channel names must be 1-100 characters."], "warn")
                 continue
             ctype = ask_int("type (0 text / 2 voice / 4 category)", 0)
-            ctype = ctype if ctype in (0, 2, 4) else 0
-            cr = rest.create_channel(gid, {"name": name, "type": ctype})
-            ok = cr.status_code in (200, 201)
-            ctx.logger.log("OP_RESULT", f"channel_create {name} | {cr.status_code}")
+            if ctype not in (0, 2, 4):
+                notice("INVALID TYPE", ["choose 0, 2, or 4."], "warn")
+                continue
+            result = rest.create_channel(gid, {"name": name, "type": ctype})
+            ok = result.status_code in (200, 201)
+            ctx.logger.log("OP_RESULT", f"channel_create {name} | {result.status_code}")
             notice("CREATED" if ok else "FAILED",
-                   [name if ok else f"status {cr.status_code}"], "good" if ok else "bad")
+                   [name if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
             continue
-        if choice.isdigit() and 1 <= int(choice) <= len(channels):
-            target = channels[int(choice) - 1]
-            action = ask("R rename | D delete | B back").lower()
-            if action == "r":
-                new_name = ask("new name", target.get("name", ""))
-                if new_name:
-                    rr = rest.patch_channel(target["id"], {"name": new_name})
-                    ok = rr.status_code == 200
-                    ctx.logger.log("OP_RESULT",
-                                   f"channel_rename {target.get('name')} to {new_name} | {rr.status_code}")
-                    notice("RENAMED" if ok else "FAILED",
-                           [new_name if ok else f"status {rr.status_code}"],
-                           "good" if ok else "bad")
-            elif action == "d":
-                if confirm(f"delete [white]{target.get('name')}[/white]?"):
-                    dr = rest.delete_channel(target["id"], reason="NiNog Raker")
-                    ok = dr.status_code in (200, 204)
-                    ctx.logger.log("OP_RESULT",
-                                   f"channel_delete {target.get('name')} | {dr.status_code}")
-                    notice("DELETED" if ok else "FAILED",
-                           [target.get("name") if ok else f"status {dr.status_code}"],
-                           "good" if ok else "bad")
-            continue
-        notice("OUT OF RANGE", [f"expected 1-{len(channels)}."], "warn")
+
+        action = ask("R rename | D delete | B back").lower()
+        if action == "r":
+            new_name = (ask("new name", target.get("name", "")) or "").strip()
+            if not _valid_resource_name(new_name):
+                notice("INVALID NAME", ["channel names must be 1-100 characters."], "warn")
+                continue
+            result = rest.patch_channel(target["id"], {"name": new_name})
+            ok = result.status_code == 200
+            ctx.logger.log(
+                "OP_RESULT",
+                f"channel_rename {target.get('name')} to {new_name} | {result.status_code}",
+            )
+            notice("RENAMED" if ok else "FAILED",
+                   [new_name if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
+        elif action == "d":
+            detail = " Category children will remain." if target.get("type") == 4 else ""
+            if not confirm(f"delete [white]{target.get('name')}[/white]?{detail}"):
+                continue
+            result = rest.delete_channel(target["id"], reason="NiNog Raker")
+            ok = result.status_code in (200, 204)
+            ctx.logger.log("OP_RESULT", f"channel_delete {target.get('name')} | {result.status_code}")
+            notice("DELETED" if ok else "FAILED",
+                   [target.get("name") if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
 
 
 def op_role_control(ctx):
     rest, gid = ctx.rest, ctx.guild["id"]
+    page_size = max(5, min(50, int(ctx.config.setting("page_size", 10))))
     while True:
-        r = rest.get_roles(gid)
-        roles = r.json() if r.status_code == 200 else []
-        table = Table(box=box.SIMPLE_HEAVY, header_style="brand",
-                      border_style="deep", padding=(0, 2))
-        table.add_column("#", justify="right", style="dim")
-        table.add_column("NAME", style="white")
-        table.add_column("ID", style="dim")
-        table.add_column("POS", justify="right", style="dim")
-        table.add_column("MANAGED", justify="center", style="dim")
-        for i, x in enumerate(roles):
-            table.add_row(str(i + 1), x.get("name", "?"), x.get("id", "?"),
-                          str(x.get("position", 0)),
-                          "yes" if x.get("managed") else "|")
-        console.print(table)
-        choice = ask(f"1-{len(roles)} target | C create | B back").lower()
-        if choice == "b":
+        response = rest.get_roles(gid)
+        if response.status_code != 200:
+            notice("API ERROR", [f"could not read roles | {response.status_code}"], "bad")
             return
-        if choice == "c":
-            name = ask("role name")
-            if not name:
+        roles = sorted(response.json(), key=lambda item: int(item.get("position", 0)), reverse=True)
+        rows = [
+            (
+                f"[white]{role.get('name', '?')}[/white] [dim]| pos {role.get('position', 0)} | "
+                f"{role.get('id', '?')}" + (" | managed" if role.get("managed") else "") + "[/dim]",
+                role,
+            )
+            for role in roles
+        ]
+        picked = _browse_rows(
+            rows, "ROLE CONTROL", False, page_size,
+            note="select a role to rename/delete, or C to create",
+            allow_create=True,
+        ) if rows else ["__create__"]
+        if picked is None:
+            return
+        target = picked[0]
+
+        if target == "__create__":
+            if len(roles) >= MAX_GUILD_ROLES:
+                notice("ROLE LIMIT", [f"this guild already has {MAX_GUILD_ROLES} roles."], "warn")
+                continue
+            name = (ask("role name") or "").strip()
+            if not _valid_resource_name(name):
+                notice("INVALID NAME", ["role names must be 1-100 characters."], "warn")
                 continue
             color = ask("color hex (blank = default)", "").lstrip("#")
+            if color and not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+                notice("INVALID COLOR", ["use exactly six hexadecimal characters."], "warn")
+                continue
             body = {"name": name, "hoist": True, "mentionable": True}
-            if re.fullmatch(r"[0-9a-fA-F]{6}", color or ""):
-                body["color"] = int(color, 16)
-            cr = rest.create_role(gid, body, reason="NiNog Raker")
-            ok = cr.status_code in (200, 201)
-            ctx.logger.log("OP_RESULT", f"role_create {name} | {cr.status_code}")
+            if color:
+                body["colors"] = {
+                    "primary_color": int(color, 16),
+                    "secondary_color": None,
+                    "tertiary_color": None,
+                }
+            result = rest.create_role(gid, body, reason="NiNog Raker")
+            ok = result.status_code in (200, 201)
+            ctx.logger.log("OP_RESULT", f"role_create {name} | {result.status_code}")
             notice("CREATED" if ok else "FAILED",
-                   [name if ok else f"status {cr.status_code}"], "good" if ok else "bad")
+                   [name if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
             continue
-        if choice.isdigit() and 1 <= int(choice) <= len(roles):
-            target = roles[int(choice) - 1]
-            if target.get("id") == gid:
-                notice("PROTECTED", ["@everyone cannot be modified here."], "warn")
-                continue
-            if target.get("managed"):
-                notice("PROTECTED", ["managed roles belong to integrations."], "warn")
-                continue
-            action = ask("R rename | D delete | B back").lower()
-            if action == "r":
-                new_name = ask("new name", target.get("name", ""))
-                if new_name:
-                    rr = rest.patch_role(gid, target["id"], {"name": new_name})
-                    ok = rr.status_code == 200
-                    ctx.logger.log("OP_RESULT",
-                                   f"role_rename {target.get('name')} to {new_name} | {rr.status_code}")
-                    notice("RENAMED" if ok else "FAILED",
-                           [new_name if ok else f"status {rr.status_code}"],
-                           "good" if ok else "bad")
-            elif action == "d":
-                if confirm(f"delete [white]{target.get('name')}[/white]?"):
-                    dr = rest.delete_role(gid, target["id"])
-                    ok = dr.status_code in (200, 204)
-                    ctx.logger.log("OP_RESULT",
-                                   f"role_delete {target.get('name')} | {dr.status_code}")
-                    notice("DELETED" if ok else "FAILED",
-                           [target.get("name") if ok else f"status {dr.status_code}"],
-                           "good" if ok else "bad")
+
+        if target.get("id") == gid:
+            notice("PROTECTED", ["@everyone cannot be modified here."], "warn")
             continue
-        notice("OUT OF RANGE", [f"expected 1-{len(roles)}."], "warn")
+        if target.get("managed"):
+            notice("PROTECTED", ["managed roles belong to integrations."], "warn")
+            continue
+        _positions, bot_top = _hierarchy_context(ctx)
+        if bot_top is not None and int(target.get("position", 0)) >= bot_top:
+            notice("ROLE HIERARCHY", ["this role is not below the bot's highest role."], "warn")
+            continue
+
+        action = ask("R rename | D delete | B back").lower()
+        if action == "r":
+            new_name = (ask("new name", target.get("name", "")) or "").strip()
+            if not _valid_resource_name(new_name):
+                notice("INVALID NAME", ["role names must be 1-100 characters."], "warn")
+                continue
+            result = rest.patch_role(gid, target["id"], {"name": new_name})
+            ok = result.status_code == 200
+            ctx.logger.log(
+                "OP_RESULT",
+                f"role_rename {target.get('name')} to {new_name} | {result.status_code}",
+            )
+            notice("RENAMED" if ok else "FAILED",
+                   [new_name if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
+        elif action == "d" and confirm(f"delete [white]{target.get('name')}[/white]?"):
+            result = rest.delete_role(gid, target["id"])
+            ok = result.status_code in (200, 204)
+            ctx.logger.log("OP_RESULT", f"role_delete {target.get('name')} | {result.status_code}")
+            notice("DELETED" if ok else "FAILED",
+                   [target.get("name") if ok else f"status {result.status_code} | {result.text[:120]}"],
+                   "good" if ok else "bad")
 
 
 # ------------------------------------------------------------
@@ -3895,8 +4241,8 @@ def op_support_bundle(ctx):
     )
     press_enter()
 
-def op(name, desc, fn):
-    return {"name": name, "desc": desc, "fn": fn}
+def op(name, desc, fn, *, workflow=True):
+    return {"name": name, "desc": desc, "fn": fn, "workflow": workflow}
 
 
 PAGES = [
@@ -3911,73 +4257,73 @@ PAGES = [
             op("Ban All", "ban every member", op_ban_all),
             op("Unban All", "lift every ban", op_unban_all),
             op("Kick All", "kick every kickable member", op_mass_kick),
-            op("Ban Member", "ban one member | any pick method", op_ban_member),
-            op("Kick Member", "kick one member | any pick method", op_kick_member),
+            op("Ban Member", "ban one member | any pick method", op_ban_member, workflow=False),
+            op("Kick Member", "kick one member | any pick method", op_kick_member, workflow=False),
             op("Change Server Name", "rename the guild", op_rename_server),
-            op("Role Engine", "roles with real permissions, aimed at anyone", op_role_engine),
-            op("Server Info", "full guild readout", op_server_info),
+            op("Role Engine", "roles with real permissions, aimed at anyone", op_role_engine, workflow=False),
+            op("Server Info", "full guild readout", op_server_info, workflow=False),
         ],
     },
     {
         "name": "RECON | RESTORE",
         "desc": "snapshot, rebuild, inspect",
         "ops": [
-            op("Snapshot Now", "capture the full server", op_snapshot_now),
-            op("Browse Snapshots", "list stored snapshots", op_browse_snapshots),
-            op("Delete Snapshot", "remove a stored snapshot", op_delete_snapshot),
-            op("Restore Full", "roles | channels | settings | messages", lambda ctx: run_restore(ctx, "full")),
-            op("Restore Channels", "recreate channel structure", lambda ctx: run_restore(ctx, "channels")),
-            op("Restore Roles", "recreate role structure", lambda ctx: run_restore(ctx, "roles")),
-            op("Restore Settings", "server settings | onboarding", lambda ctx: run_restore(ctx, "settings")),
-            op("Member Lookup", "view one member in detail", op_member_lookup),
-            op("Scan Bots", "find every bot in the server", op_scan_bots),
-            op("View Ban List", "all bans, paginated", op_view_ban_list),
-            op("Unban Member", "pick from ban list", op_unban_member),
+            op("Snapshot Now", "capture the full server", op_snapshot_now, workflow=False),
+            op("Browse Snapshots", "list stored snapshots", op_browse_snapshots, workflow=False),
+            op("Delete Snapshot", "remove a stored snapshot", op_delete_snapshot, workflow=False),
+            op("Restore Full", "roles | channels | settings | messages", lambda ctx: run_restore(ctx, "full"), workflow=False),
+            op("Restore Channels", "recreate channel structure", lambda ctx: run_restore(ctx, "channels"), workflow=False),
+            op("Restore Roles", "recreate role structure", lambda ctx: run_restore(ctx, "roles"), workflow=False),
+            op("Restore Settings", "server settings | onboarding", lambda ctx: run_restore(ctx, "settings"), workflow=False),
+            op("Member Lookup", "view one member in detail", op_member_lookup, workflow=False),
+            op("Scan Bots", "find every bot in the server", op_scan_bots, workflow=False),
+            op("View Ban List", "all bans, paginated", op_view_ban_list, workflow=False),
+            op("Unban Member", "pick from ban list", op_unban_member, workflow=False),
         ],
     },
     {
         "name": "MESSAGING | WEBHOOKS",
         "desc": "messages, DMs, webhook work",
         "ops": [
-            op("Send Message", "post to one channel", op_send_message),
+            op("Send Message", "post to one channel", op_send_message, workflow=False),
             op("DM All", "DM every human member", op_dm_all),
             op("Purge Messages", "wipe recent messages per channel", op_purge_messages),
             op("Create Webhooks", "webhooks across all channels", op_create_webhooks),
             op("Webhook Spam", "execute existing webhooks", op_webhook_spam),
             op("Delete All Webhooks", "wipe every webhook", op_delete_all_webhooks),
-            op("Extract Webhooks", "pull every webhook url out of the server", op_extract_webhooks),
-            op("Create Invite", "generate an invite link", op_create_invite),
+            op("Extract Webhooks", "pull every webhook url out of the server", op_extract_webhooks, workflow=False),
+            op("Create Invite", "generate an invite link", op_create_invite, workflow=False),
         ],
     },
     {
         "name": "PRECISION TOOLS",
         "desc": "targeted single-target control",
         "ops": [
-            op("Channel Control", "create | rename | delete channels", op_channel_control),
-            op("Role Control", "create | rename | delete roles", op_role_control),
+            op("Channel Control", "create | rename | delete channels", op_channel_control, workflow=False),
+            op("Role Control", "create | rename | delete roles", op_role_control, workflow=False),
         ],
     },
     {
         "name": "WHITELIST",
         "desc": "protected users | mass whitelist actions",
         "ops": [
-            op("Add By Username", "fuzzy search the guild", op_whitelist_add_search),
-            op("Add By User ID", "direct id entry", op_whitelist_add_id),
-            op("Add From DMs", "pick from users who DM'd the bot", op_whitelist_add_dms),
-            op("Remove Entries", "checkbox removal", op_whitelist_remove),
-            op("Mass Unban", "unban selected whitelisted", op_whitelist_unban),
-            op("Mass Ban", "ban selected whitelisted", op_whitelist_ban),
-            op("DM Invite", "DM selected an invite link", op_whitelist_dm_invite),
-            op("DM Message", "DM selected a message", op_whitelist_dm_message),
+            op("Add By Username", "fuzzy search the guild", op_whitelist_add_search, workflow=False),
+            op("Add By User ID", "direct id entry", op_whitelist_add_id, workflow=False),
+            op("Add From DMs", "pick from users who DM'd the bot", op_whitelist_add_dms, workflow=False),
+            op("Remove Entries", "checkbox removal", op_whitelist_remove, workflow=False),
+            op("Mass Unban", "unban selected whitelisted", op_whitelist_unban, workflow=False),
+            op("Mass Ban", "ban selected whitelisted", op_whitelist_ban, workflow=False),
+            op("DM Invite", "DM selected an invite link", op_whitelist_dm_invite, workflow=False),
+            op("DM Message", "DM selected a message", op_whitelist_dm_message, workflow=False),
         ],
     },
     {
         "name": "TOOL MANAGEMENT",
         "desc": "the tool takes care of itself here",
         "ops": [
-            op("Diagnoser", "full health check: source, config, api, fs", op_diagnoser),
-            op("Report Explorer", "browse session logs and crash bundles", op_report_explorer),
-            op("Support Bundle", "package everything for THE RATTIKANS", op_support_bundle),
+            op("Diagnoser", "full health check: source, config, api, fs", op_diagnoser, workflow=False),
+            op("Report Explorer", "browse session logs and crash bundles", op_report_explorer, workflow=False),
+            op("Support Bundle", "package everything for THE RATTIKANS", op_support_bundle, workflow=False),
         ],
     },
 ]
@@ -3990,7 +4336,7 @@ OP_INDEX = build_index(PAGES)
 PAGES.append(
     {
         "name": "WORKFLOWS",
-        "desc": "chained ops with pre-set inputs",
+        "desc": "guided, reusable operation chains",
         "ops": [
             op(name, desc, partial(fn, index=OP_INDEX))
             for name, desc, fn in page_ops()
@@ -4129,6 +4475,15 @@ def page_loop(ctx):
             if 1 <= n <= len(page["ops"]):
                 entry = page["ops"][n - 1]
                 ctx.logger.log("OP_RUN", f"{page['name']} > {entry['name']}")
+                required = missing_perms(slugify(entry["name"]), ctx)
+                if required:
+                    notice(
+                        "MISSING PERMISSION",
+                        ["this operation needs:", *[f"  {name}" for name in required]],
+                        "bad",
+                    )
+                    press_enter()
+                    continue
                 try:
                     entry["fn"](ctx)
                 except ApiNetworkError as e:

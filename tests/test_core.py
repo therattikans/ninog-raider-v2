@@ -85,6 +85,48 @@ class RestTests(unittest.TestCase):
         rest.session.request.assert_not_called()
         self.assertNotIn("Authorization", rest.external.headers)
 
+    def test_member_role_uses_idempotent_endpoint(self):
+        rest = self.make_rest()
+        rest.add_member_role("1", "2", "3", reason="restore")
+        args = rest.session.request.call_args.args
+        kwargs = rest.session.request.call_args.kwargs
+        self.assertEqual(args[:2], ("PUT", "https://discord.com/api/v10/guilds/1/members/2/roles/3"))
+        self.assertIsNone(kwargs["json"])
+        self.assertEqual(kwargs["headers"]["X-Audit-Log-Reason"], "restore")
+
+    def test_bulk_ban_caps_payload_and_message_window(self):
+        rest = self.make_rest()
+        rest.bulk_ban("1", range(250), delete_message_seconds=999999)
+        args = rest.session.request.call_args.args
+        body = rest.session.request.call_args.kwargs["json"]
+        self.assertEqual(args[:2], ("POST", "https://discord.com/api/v10/guilds/1/bulk-ban"))
+        self.assertEqual(len(body["user_ids"]), 200)
+        self.assertEqual(body["delete_message_seconds"], 604800)
+
+    def test_invalid_webhook_url_is_rejected_before_network(self):
+        rest = self.make_rest()
+        rest.external.post = Mock()
+        with self.assertRaises(core.ApiNetworkError):
+            rest.execute_webhook("https://example.com/api/webhooks/1/token", {"content": "x"})
+        rest.external.post.assert_not_called()
+
+    def test_route_keys_keep_major_ids_and_normalize_message_ids(self):
+        one = core.DiscordREST._route_key("DELETE", "/channels/123/messages/456")
+        two = core.DiscordREST._route_key("DELETE", "/channels/123/messages/789")
+        other_channel = core.DiscordREST._route_key("DELETE", "/channels/999/messages/456")
+        self.assertEqual(one, two)
+        self.assertNotEqual(one, other_channel)
+
+    def test_bucket_hash_is_scoped_to_major_resource(self):
+        limiter = core.RateLimiter(safety=0)
+        headers = {"X-RateLimit-Bucket": "same", "X-RateLimit-Remaining": "1"}
+        limiter.note_response(Response(headers=headers), "GET /channels/123/messages")
+        limiter.note_response(Response(headers=headers), "GET /channels/999/messages")
+        self.assertNotEqual(
+            limiter._route_buckets["GET /channels/123/messages"],
+            limiter._route_buckets["GET /channels/999/messages"],
+        )
+
 
 class WatchdogTests(unittest.TestCase):
     def test_watchdog_uses_the_bot_snowflake(self):
