@@ -1,29 +1,3 @@
-# ==============================================================
-#   NiNog Raker v2.0 | THE RATTIKANS
-#   src/ops.py | every interactive flow and operation
-# ==============================================================
-#
-#   Top of the stack. Imports src.core (state, REST, persistence)
-#   and src.ui (drawing). Nothing imports this except main.py.
-#
-#   Layout, in source order:
-#     1  token vault flows
-#     2  guild selection
-#     3  snapshot engine
-#     4  restore engine
-#     5  offence ops
-#     6  messaging + webhook ops
-#     7  precision ops
-#     8  whitelist UI
-#     9  snapshot page ops
-#     10 settings screen
-#     11 page registry + router
-#
-#   Every destructive op calls ensure_pre_op_snapshot() first, and
-#   every one of them has a matching inverse further down the page
-#   list. Keep that pairing intact when adding ops.
-# ==============================================================
-
 import base64
 import difflib
 import json
