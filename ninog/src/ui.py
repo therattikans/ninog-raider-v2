@@ -1,18 +1,3 @@
-# ==============================================================
-#   NiNog Raker v2.0 | THE RATTIKANS
-#   src/ui.py | themes, gradient, prompts, transitions,
-#              bouncing-R live displays
-# ==============================================================
-#
-#   Presentation only. May import src.core, must not import src.ops.
-#
-#   The ASCII background experiment was removed. Its replacement is
-#   the bouncing ANSI-Shadow R: OpProgress (the status spinner) and
-#   TodoBoard (the workflow checklist). Both draw into a private
-#   screen region from a daemon thread so they animate while the
-#   main thread is blocked on network I/O.
-# ==============================================================
-
 import getpass
 import math
 import random
