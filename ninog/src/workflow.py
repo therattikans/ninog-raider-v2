@@ -385,33 +385,128 @@ def delete_workflow_file(name):
     return False
 
 
+# What each chainable op asks, in the order it asks it. This is a GUIDE
+# for the builder -- shown so the user knows which question each recorded
+# answer serves. Replays match answers to prompts by position; if a live
+# server state makes an op ask extra questions (pickers, paged lists),
+# those simply get asked at run time, so an imperfect guide costs nothing.
+PROMPT_GUIDE = {
+    "ban_all": ["confirm ban every member (y/n)"],
+    "ban_member": ["pick the member (picker: whitelist / server / username / id)",
+                   "delete message history days (0-7)", "confirm ban (y/n)"],
+    "rename_server": ["new server name", "confirm rename (y/n)"],
+    "flood_channels": ["channel name", "how many", "type (0 text / 2 voice)",
+                       "confirm create (y/n)"],
+    "flood_roles": ["role name", "how many", "color hex (blank = default)",
+                    "confirm create (y/n)"],
+    "wipe_channels": ["confirm delete ALL channels (y/n)"],
+    "wipe_roles": ["confirm delete ALL deletable roles (y/n)"],
+    "mass_kick": ["confirm kick the members (y/n)"],
+    "kick_member": ["pick the member (picker)", "confirm kick (y/n)"],
+    "role_engine": ["targets: 1 whitelist | 2 handpick-wl | 3 handpick-server | 4 everyone | 5 everyone-except | 6 one user",
+                    "(handpick modes) picker answers",
+                    "perm preset: 1 admin | 2 moderator | 3 channel mgr | 4 view | 5 custom",
+                    "(custom) permission toggle numbers, then D",
+                    "delivery: 1 one shared role | 2 role per user",
+                    "role name (blank = random)",
+                    "color hex, R random, or blank",
+                    "hoist on member list? (y/n)",
+                    "confirm execute (y/n)"],
+    "server_info": [],
+    "unban_all": ["confirm unban all (y/n)"],
+    "create_invite": [],
+    "create_webhooks": ["webhook name", "webhooks per channel", "confirm create (y/n)"],
+    "dm_all": ["message to DM every human member", "confirm DM count (y/n)"],
+    "delete_all_webhooks": ["confirm delete ALL webhooks (y/n)"],
+    "extract_webhooks": ["delivery: 1 display | 2 clipboard | 3 relay | 4 file | B done",
+                         "(relay) destination webhook url",
+                         "(loops for more deliveries) B to finish"],
+    "purge_messages": ["confirm purge text channels (y/n)",
+                       "(optional) channel # to limit scope | B for all"],
+    "send_message": ["channel # from the list", "message content"],
+    "webhook_spam": ["message to spam", "sends per webhook", "confirm send (y/n)"],
+    "channel_control": ["channel # to manage | C create | B done",
+                        "(create) channel name",
+                        "(create) type: 0 text | 2 voice | 4 category",
+                        "action: R rename | D delete | B back",
+                        "(rename) new name",
+                        "(delete) confirm (y/n)"],
+    "role_control": ["role # to manage | C create | B done",
+                     "(create) role name",
+                     "(create) color hex (blank = default)",
+                     "action: R rename | D delete | B back",
+                     "(rename) new name",
+                     "(delete) confirm (y/n)",
+                     "(perms) toggle numbers | A all | N none | D done"],
+    "add_by_id": ["user id", "(if it cannot be verified) use it anyway? (y/n)"],
+    "whitelist_add_id": ["user id", "(if it cannot be verified) use it anyway? (y/n)"],
+    "add_by_username": ["username to search", "pick # from the matches"],
+    "whitelist_add_search": ["username to search", "pick # from the matches"],
+    "add_from_dms": ["pick # from the DM list"],
+    "whitelist_add_dms": ["pick # from the DM list"],
+    "remove_entries": ["checkbox numbers to remove | D done", "confirm remove (y/n)"],
+    "whitelist_remove": ["checkbox numbers to remove | D done", "confirm remove (y/n)"],
+    "mass_ban": ["select from whitelist (picker menu)", "confirm ban (y/n)"],
+    "mass_unban": ["select from whitelist (picker menu)", "confirm unban (y/n)"],
+    "dm_invite": ["select from whitelist (picker menu)", "confirm send (y/n)"],
+    "dm_message": ["select from whitelist (picker menu)", "message text"],
+    "snapshot_now": [],
+    "browse_snapshots": ["snapshot # to view | B done"],
+    "delete_snapshot": ["snapshot # to delete", "confirm delete (y/n)"],
+    "restore_full": ["snapshot # from the list", "confirm restore (y/n)"],
+    "restore_roles": ["snapshot # from the list", "confirm restore (y/n)"],
+    "restore_channels": ["snapshot # from the list", "confirm restore (y/n)"],
+    "restore_settings": ["snapshot # from the list", "confirm restore (y/n)"],
+    "member_lookup": ["pick the member (picker)"],
+    "scan_bots": [],
+    "unban_member": ["ban entry # from the list | B back"],
+    "view_ban_list": ["N next | P prev | B done"],
+    "diagnoser": [],
+    "report_explorer": ["entry # to open | N/P pages | D n delete | B done"],
+    "support_bundle": ["confirm build bundle (y/n)"],
+}
+
 # ------------------------------------------------------------
 # ANSWER RECORDER — pre-set the op's inputs for when it fires
 # ------------------------------------------------------------
 
-def _record_answers(ctx, op_name):
-    """Capture the exact answers an op will need, in prompt order."""
+def _record_answers(ctx, op_name, slug=None):
+    """Capture the answers an op will need, labeled by the question they serve."""
     console.print()
-    screen_title(f"PRE-SET INPUTS | {op_name}", "what the op will ask, answered once, now")
-    console.print("  [dim]Type each answer exactly as you would answer the op live,[/dim]")
-    console.print("  [dim]in order, one per line. The op reuses them when it fires.[/dim]")
-    console.print("  [dim]Blank line = take the op's default for that question.[/dim]")
-    console.print("  [dim]Type END on its own line to finish recording.[/dim]")
-    answers = []
-    while len(answers) < MAX_RECORDED_ANSWERS:
-        raw = ask(f"answer #{len(answers) + 1} (END finishes)")
+    screen_title(f"PRE-SET INPUTS | {op_name}", "answer its questions once, right here")
+    guide = PROMPT_GUIDE.get(slug or "", []) or []
+    if guide:
+        console.print("  [white]this op asks, in order:[/white]")
+        for i, q in enumerate(guide, 1):
+            console.print(f"    [dim]{i}.[/dim] {q}")
+    else:
+        console.print("  [white]this op asks nothing.[/white] it fires with no inputs.")
+    console.print()
+    console.print("  [dim]Enter one answer per question below, in the same order.[/dim]")
+    console.print("  [dim]Blank = the op's default. END on its own line finishes early.[/dim]")
+
+    answers, labels = [], []
+    n = 0
+    while n < MAX_RECORDED_ANSWERS:
+        label = guide[n] if n < len(guide) else f"extra answer #{n + 1}"
+        if not guide and n == 0:
+            break
+        raw = ask(f"  {n + 1}. {label}")
         if raw is None or str(raw).strip().upper() == "END":
             break
         answers.append(raw)
+        labels.append(label)
+        n += 1
     if answers:
         notice("RECORDED",
                [f"[white]{len(answers)}[/white] answer(s) locked in for [white]{op_name}[/white].",
-                "the op fires hands-free. if the live server state forces",
-                "an extra question, it gets asked at run time."], "good")
+                "the op fires hands-free. anything you skipped gets asked live."])
     else:
         notice("NOTHING RECORDED",
-               [f"[white]{op_name}[/white] will ask its questions live when it fires."], "warn")
-    return answers
+               [f"[white]{op_name}[/white] will ask its questions live when it fires."]
+               if guide else
+               [f"[white]{op_name}[/white] needs no inputs. ready to fire."],)
+    return answers, labels
 
 
 def _pick_trigger():
@@ -439,19 +534,40 @@ def _pick_trigger():
 
 
 def _pick_op(ctx, index):
-    """Flat numbered picker over every chainable op."""
-    entries = sorted(index.items(), key=lambda kv: (kv[1].get("page", ""), kv[1]["name"]))
+    """Category first (one screen), then the op. No 44-line scrolls."""
+    # preserve the order pages were registered in
+    categories = []
+    for slug, e in index.items():
+        page = e.get("page", "") or "OPS"
+        if page not in [c[0] for c in categories]:
+            categories.append((page, []))
+        for c in categories:
+            if c[0] == page:
+                c[1].append((slug, e))
+                break
     console.print()
-    screen_title("ADD OP", "every op, one number away")
-    for i, (slug, e) in enumerate(entries, 1):
-        console.print(f"  [orange][{i:02d}][/orange] [white]{e['name']}[/white] "
-                      f"[dim]{e.get('page', '')} | {e.get('desc', '')}[/dim]")
-    raw = ask(f"1-{len(entries)} | B back").lower().strip()
+    screen_title("ADD OP", "pick a category")
+    for i, (cat, ops_list) in enumerate(categories, 1):
+        console.print(f"  [orange][{i}][/orange] [white]{cat}[/white] "
+                      f"[dim]{len(ops_list)} ops[/dim]")
+    raw = ask(f"1-{len(categories)} | B back").lower().strip()
     if raw in ("b", "", "q"):
         return None
-    if raw.isdigit() and 1 <= int(raw) <= len(entries):
-        return entries[int(raw) - 1]
-    notice("OUT OF RANGE", [f"1-{len(entries)} | B back."], "warn")
+    if not (raw.isdigit() and 1 <= int(raw) <= len(categories)):
+        notice("OUT OF RANGE", [f"1-{len(categories)} | B back."], "warn")
+        return None
+    cat, ops_list = categories[int(raw) - 1]
+    console.print()
+    screen_title(f"ADD OP | {cat}", "one number away")
+    for i, (slug, e) in enumerate(ops_list, 1):
+        console.print(f"  [orange][{i:02d}][/orange] [white]{e['name']}[/white] "
+                      f"[dim]{e.get('desc', '')}[/dim]")
+    raw = ask(f"1-{len(ops_list)} | B back").lower().strip()
+    if raw in ("b", "", "q"):
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= len(ops_list):
+        return ops_list[int(raw) - 1]
+    notice("OUT OF RANGE", [f"1-{len(ops_list)} | B back."], "warn")
     return None
 
 
@@ -478,9 +594,13 @@ def create_workflow(ctx, index):
             break
         slug, entry = picked
         # The contract: options are chosen NOW, for when it fires — never
-        # invented mid-run.
-        answers = _record_answers(ctx, entry["name"])
-        steps.append({"kind": "op", "op": slug, "answers": answers})
+        # invented mid-run. Labels ride along so the re-record screen can
+        # show which question each stored answer serves.
+        answers, labels = _record_answers(ctx, entry["name"], slug)
+        step = {"kind": "op", "op": slug, "answers": answers}
+        if labels:
+            step["labels"] = labels
+        steps.append(step)
 
     if not steps:
         notice("EMPTY", ["a workflow with no steps was not saved."], "warn")
@@ -527,7 +647,22 @@ def _rerecord_inputs(ctx, index, flows):
         notice("NOT AN OP", ["only op steps carry inputs."], "warn")
         return False
     name = (index.get(step.get("op", "")) or {}).get("name", step.get("op", "?"))
-    step["answers"] = _record_answers(ctx, name)
+    old = step.get("answers") or []
+    old_labels = step.get("labels") or []
+    if old:
+        console.print()
+        console.print("  [white]currently stored:[/white]")
+        for i, a in enumerate(old):
+            lab = old_labels[i] if i < len(old_labels) else f"answer #{i + 1}"
+            console.print(f"    [dim]{i + 1}.[/dim] {lab}  [orange]=[/orange] [white]{a!r}[/white]")
+    else:
+        console.print("  [dim]nothing stored yet — this op asks live when it fires.[/dim]")
+    answers, labels = _record_answers(ctx, name, step.get("op"))
+    step["answers"] = answers
+    if labels:
+        step["labels"] = labels
+    else:
+        step.pop("labels", None)
     save_workflow(flow)
     ctx.logger.log("WORKFLOW_EDITED", f"{flow.get('name')} | step {si + 1} re-recorded")
     notice("UPDATED",
