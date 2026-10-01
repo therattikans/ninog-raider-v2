@@ -4,11 +4,11 @@
 #                vault + whitelist persistence, REST client
 # ==============================================================
 #
-#   Bottom of the stack. This module must never import src.ui or
+#   IMPORTANT!!! Bottom of the stack. This module must never import src.ui or
 #   src.ops -- ui and ops are allowed to import this, not the other
 #   way round. Every function here is either pure I/O on local files
 #   or a network call; nothing draws on screen except the REST
-#   client's logger hooks, which are write-only.
+#   client's logger hooks, which are write-only
 # ==============================================================
 
 import json
